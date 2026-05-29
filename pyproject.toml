@@ -2,7 +2,7 @@
 name = "endpoint-security"
 version = "0.1.0"
 description = "Report Mac device encryption status from Google Workspace via the Cloud Identity Devices API."
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "google-auth>=2.28",
     "google-api-python-client>=2.120",
