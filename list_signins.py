@@ -209,7 +209,7 @@ def main() -> int:
     except KeyError as exc:
         print(f"Missing required env var: {exc.args[0]}", file=sys.stderr)
         print("  export SA_EMAIL=endpoint-security-reader@<PROJECT>.iam.gserviceaccount.com", file=sys.stderr)
-        print("  export WORKSPACE_ADMIN_EMAIL=<a super-admin in your tenant>", file=sys.stderr)
+        print("  export WORKSPACE_ADMIN_EMAIL=<admin with Reports API read privilege>", file=sys.stderr)
         return 2
 
     creds = build_credentials(sa_email, admin_email, SCOPES)

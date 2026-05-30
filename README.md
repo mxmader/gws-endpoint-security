@@ -50,6 +50,9 @@ additive. Default is `user:<your active gcloud account>`.
 
 ### Finish in the Admin Console (manual — no API for this)
 
+This step requires a **super admin** because the DWD page itself is gated
+to super admins by Google. It's a one-time configuration.
+
 Open <https://admin.google.com/ac/owl/domainwidedelegation>, click **Add new**
 (or edit the existing entry for the printed Client ID), and paste the Client
 ID and the **comma-separated** scope list `setup.sh` printed:
@@ -60,7 +63,24 @@ https://www.googleapis.com/auth/admin.reports.audit.readonly
 ```
 
 The first scope powers `list_mac_devices.py`; the second powers
-`list_app_authorizations.py`. Wait ~2 minutes for propagation.
+`list_app_authorizations.py` and `list_signins.py`. Wait ~2 minutes for
+propagation.
+
+## `WORKSPACE_ADMIN_EMAIL` — what privileges does it need?
+
+The impersonated identity does **not** need to be a super admin. It needs
+to be a Workspace user with an admin role that includes the right read
+privileges for each script. Best practice is a dedicated "Security
+Read-Only" custom admin role assigned to a service-style account.
+
+| Script | Required admin-role privilege |
+|---|---|
+| `list_mac_devices.py` | Services → **Mobile Device Management** (Read) |
+| `list_app_authorizations.py` | Admin API Privileges → **Reports** (Read) |
+| `list_signins.py` | Admin API Privileges → **Reports** (Read) |
+
+A single role with both privileges covers all three scripts. The only
+*super-admin*-only thing in the whole flow is the one-time DWD entry above.
 
 ## Run the reports
 
@@ -68,7 +88,7 @@ The first scope powers `list_mac_devices.py`; the second powers
 uv sync
 
 export SA_EMAIL=endpoint-security-reader@<PROJECT>.iam.gserviceaccount.com
-export WORKSPACE_ADMIN_EMAIL=admin@yourdomain.com   # any super-admin
+export WORKSPACE_ADMIN_EMAIL=security-reader@yourdomain.com  # see privilege table above
 
 uv run python list_mac_devices.py                   # all Macs + encryption status
 uv run python list_app_authorizations.py --days 30  # OAuth app grants, last 30 days
@@ -77,7 +97,7 @@ uv run python list_signins.py --days 7              # sign-in events with IP + m
 
 All three scripts accept `--json` for raw output. See `--help` on each for
 other flags (`--clients`, `--view`, `--user`, `--show-revoked`,
-`--failures-only`, …).
+`--failures-only`, `--suspicious-only`, …).
 
 ## How auth works (no key file)
 

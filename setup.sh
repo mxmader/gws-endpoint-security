@@ -123,9 +123,10 @@ Click "Add new" (or edit the existing entry for this Client ID) and enter:
 To run the reports once DWD is set up:
 
   export SA_EMAIL="${SA_EMAIL}"
-  export WORKSPACE_ADMIN_EMAIL="<a super-admin in your tenant>"
+  export WORKSPACE_ADMIN_EMAIL="<admin with the right read privileges; see README>"
   uv run python list_mac_devices.py
   uv run python list_app_authorizations.py --days 30
+  uv run python list_signins.py --days 7
 
 EOF
 
