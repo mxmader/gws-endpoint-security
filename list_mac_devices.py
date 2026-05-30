@@ -18,10 +18,12 @@ from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-SCOPE = "https://www.googleapis.com/auth/cloud-identity.devices.readonly"
+SCOPES = ["https://www.googleapis.com/auth/cloud-identity.devices.readonly"]
 
 
-def build_credentials(sa_email: str, admin_email: str) -> service_account.Credentials:
+def build_credentials(
+    sa_email: str, admin_email: str, scopes: list[str]
+) -> service_account.Credentials:
     source_creds, _ = google.auth.default(
         scopes=["https://www.googleapis.com/auth/iam"],
     )
@@ -30,7 +32,7 @@ def build_credentials(sa_email: str, admin_email: str) -> service_account.Creden
         signer=signer,
         service_account_email=sa_email,
         token_uri="https://oauth2.googleapis.com/token",
-        scopes=[SCOPE],
+        scopes=scopes,
         subject=admin_email,
     )
 
@@ -58,6 +60,34 @@ def fetch_mac_device_users(svc) -> dict[str, list[dict]]:
             })
         req = svc.devices().deviceUsers().list_next(req, resp)
     return by_device
+
+
+def fetch_device_full(session: AuthorizedSession, device_name: str) -> dict:
+    """devices.get() via raw HTTP so callers can parallelize.
+
+    The summary view returned by devices.list() strips out
+    endpointVerificationSpecificAttributes; only devices.get() returns it.
+    """
+    url = f"https://cloudidentity.googleapis.com/v1/{device_name}"
+    r = session.get(url)
+    r.raise_for_status()
+    return r.json()
+
+
+def extract_browser(full_device: dict) -> str:
+    """Pull a short 'Chrome <version>' string from the EV signal block, if present.
+
+    Only Chrome appears here — EV is a Chrome extension, so other browsers
+    (Firefox, Safari, Edge) never report signals through this surface. Returns
+    empty string when EV isn't reporting for this device.
+    """
+    ev = full_device.get("endpointVerificationSpecificAttributes") or {}
+    for ba in ev.get("browserAttributes", []):
+        chrome = ba.get("chromeBrowserInfo") or {}
+        version = chrome.get("browserVersion")
+        if version:
+            return f"Chrome {version}"
+    return ""
 
 
 def fetch_client_ids(session: AuthorizedSession, device_user_name: str) -> list[str]:
@@ -103,20 +133,10 @@ def list_mac_devices(creds: service_account.Credentials, view: str, with_clients
     )
     users_by_device = fetch_mac_device_users(svc)
 
-    # Pre-compute clientIds in parallel before yielding rows, since downstream
-    # rendering needs them aligned with the device sequence. Cheaper to fan
-    # out once than to interleave per-device.
-    client_ids_by_du: dict[str, list[str]] = {}
-    if with_clients:
-        all_du_names = [u["name"] for du_list in users_by_device.values() for u in du_list]
-        session = AuthorizedSession(creds)
-        with ThreadPoolExecutor(max_workers=10) as pool:
-            for du_name, ids in zip(
-                all_du_names,
-                pool.map(lambda n: fetch_client_ids(session, n), all_du_names),
-            ):
-                client_ids_by_du[du_name] = ids
-
+    # Collect summary records first so we can fan out devices.get() in parallel
+    # — the summary view from devices.list() strips out
+    # endpointVerificationSpecificAttributes, which is where browser info lives.
+    summaries: list[dict] = []
     req = svc.devices().list(
         customer="customers/my_customer",
         filter="type:mac",
@@ -124,18 +144,42 @@ def list_mac_devices(creds: service_account.Credentials, view: str, with_clients
     )
     while req is not None:
         resp = req.execute()
-        for d in resp.get("devices", []):
-            users = users_by_device.get(_device_id(d.get("name", "")), [])
-            d["userEmails"] = [u["userEmail"] for u in users if u.get("userEmail")]
-            if with_clients:
-                seen: list[str] = []
-                for u in users:
-                    for cid in client_ids_by_du.get(u["name"], []):
-                        if cid not in seen:
-                            seen.append(cid)
-                d["clientIds"] = seen
-            yield d
+        summaries.extend(resp.get("devices", []))
         req = svc.devices().list_next(req, resp)
+
+    session = AuthorizedSession(creds)
+
+    device_names = [d["name"] for d in summaries]
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        fulls = list(pool.map(lambda n: fetch_device_full(session, n), device_names))
+    full_by_name = dict(zip(device_names, fulls))
+
+    client_ids_by_du: dict[str, list[str]] = {}
+    if with_clients:
+        all_du_names = [u["name"] for du_list in users_by_device.values() for u in du_list]
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            for du_name, ids in zip(
+                all_du_names,
+                pool.map(lambda n: fetch_client_ids(session, n), all_du_names),
+            ):
+                client_ids_by_du[du_name] = ids
+
+    for d in summaries:
+        full = full_by_name.get(d["name"], {})
+        # Merge fields the summary view omitted (e.g. hostname, EV attributes).
+        for k, v in full.items():
+            d.setdefault(k, v)
+        users = users_by_device.get(_device_id(d.get("name", "")), [])
+        d["userEmails"] = [u["userEmail"] for u in users if u.get("userEmail")]
+        d["browser"] = extract_browser(full)
+        if with_clients:
+            seen: list[str] = []
+            for u in users:
+                for cid in client_ids_by_du.get(u["name"], []):
+                    if cid not in seen:
+                        seen.append(cid)
+            d["clientIds"] = seen
+        yield d
 
 
 def classify_signals(d: dict) -> str:
@@ -164,6 +208,7 @@ def render_table(devices: list[dict], with_clients: bool) -> str:
     def row(d: dict) -> tuple:
         base = (
             ", ".join(d.get("userEmails") or []) or "-",
+            d.get("browser") or "-",
             classify_signals(d),
             d.get("serialNumber", "-"),
             d.get("model", "-"),
@@ -176,7 +221,7 @@ def render_table(devices: list[dict], with_clients: bool) -> str:
         return base
 
     rows = [row(d) for d in devices]
-    headers = ("USER", "SIGNALS", "SERIAL", "MODEL", "ASSET_TAG", "ENCRYPTION", "LAST_SYNC")
+    headers = ("USER", "BROWSER", "SIGNALS", "SERIAL", "MODEL", "ASSET_TAG", "ENCRYPTION", "LAST_SYNC")
     if with_clients:
         headers = headers + ("CLIENTS",)
     widths = [
@@ -218,7 +263,7 @@ def main() -> int:
         print("  export WORKSPACE_ADMIN_EMAIL=<a super-admin in your tenant>", file=sys.stderr)
         return 2
 
-    creds = build_credentials(sa_email, admin_email)
+    creds = build_credentials(sa_email, admin_email, SCOPES)
     devices = list(list_mac_devices(creds, args.view, args.clients))
 
     if args.json:

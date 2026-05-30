@@ -5,7 +5,10 @@ set -euo pipefail
 
 SA_NAME="${SA_NAME:-endpoint-security-reader}"
 SA_DISPLAY="Endpoint Security Reader"
-SCOPE="https://www.googleapis.com/auth/cloud-identity.devices.readonly"
+SCOPES=(
+  "https://www.googleapis.com/auth/cloud-identity.devices.readonly"
+  "https://www.googleapis.com/auth/admin.reports.audit.readonly"
+)
 DWD_URL="https://admin.google.com/ac/owl/domainwidedelegation"
 
 OPEN_ADMIN=0
@@ -68,8 +71,11 @@ echo
 
 gcloud config set project "$GCP_PROJECT_ID" >/dev/null
 
-echo "==> Enabling required APIs (cloudidentity, iamcredentials)..."
-gcloud services enable cloudidentity.googleapis.com iamcredentials.googleapis.com
+echo "==> Enabling required APIs (cloudidentity, iamcredentials, admin)..."
+gcloud services enable \
+  cloudidentity.googleapis.com \
+  iamcredentials.googleapis.com \
+  admin.googleapis.com
 
 echo "==> Creating service account (if missing)..."
 if gcloud iam service-accounts describe "$SA_EMAIL" >/dev/null 2>&1; then
@@ -101,20 +107,25 @@ fi
 OAUTH_CLIENT_ID="$(gcloud iam service-accounts describe "$SA_EMAIL" \
   --format='value(oauth2ClientId)')"
 
+# Comma-separated string for the Admin Console DWD form, which accepts
+# multiple scopes as one comma-delimited field.
+SCOPES_CSV="$(IFS=, ; echo "${SCOPES[*]}")"
+
 cat <<EOF
 
 ─── ACTION REQUIRED: complete domain-wide delegation ────────────────────────
 Open: ${DWD_URL}
-Click "Add new" and enter:
-  Client ID:   ${OAUTH_CLIENT_ID}
-  OAuth scope: ${SCOPE}
+Click "Add new" (or edit the existing entry for this Client ID) and enter:
+  Client ID:    ${OAUTH_CLIENT_ID}
+  OAuth scopes: ${SCOPES_CSV}
 ─────────────────────────────────────────────────────────────────────────────
 
-To run the report once DWD is set up:
+To run the reports once DWD is set up:
 
   export SA_EMAIL="${SA_EMAIL}"
   export WORKSPACE_ADMIN_EMAIL="<a super-admin in your tenant>"
-  python list_mac_devices.py
+  uv run python list_mac_devices.py
+  uv run python list_app_authorizations.py --days 30
 
 EOF
 
