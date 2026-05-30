@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""List Workspace sign-in events from the Admin SDK Reports `login` activity log.
+
+Surfaces who signed in (or tried to), when, from which IP, and via which
+method (`google_password`, `saml`, `oauth`, `unknown`), plus a `suspicious`
+flag Google sets on risky sign-ins.
+
+**What this script does NOT include**: the browser user-agent string.
+Login events in the Reports API don't carry a `user_agent` parameter — IP
+is the closest "where from" identifier on this surface. If you need browser
+attribution, see `list_mac_devices.py` (Cloud Identity Devices) for the
+EV-equipped subset of machines; there's no per-sign-in browser data
+available from Workspace audit logs.
+
+Auth: keyless. Same pattern as the other reports — local gcloud ADC + IAM
+signJwt to mint a DWD-impersonated admin token. Requires the DWD entry to
+include `admin.reports.audit.readonly` (already set up for the token
+report).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+
+from googleapiclient.discovery import build
+
+from list_mac_devices import build_credentials
+
+SCOPES = ["https://www.googleapis.com/auth/admin.reports.audit.readonly"]
+
+# US states + territories — ISO 3166-2:US subdivision code -> name.
+# Only US is mapped inline (this fleet is US-based and a full ISO subdivision
+# table is too much to maintain by hand). Non-US codes render as raw ISO.
+_US_SUBDIVISIONS = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+    "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+    "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+    "VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
+    "WI": "Wisconsin", "WY": "Wyoming",
+    "DC": "District of Columbia",
+    "PR": "Puerto Rico", "VI": "U.S. Virgin Islands", "GU": "Guam",
+    "MP": "Northern Mariana Islands", "AS": "American Samoa",
+}
+
+
+def render_location(network_info: dict) -> str:
+    """Format `networkInfo` into a human-friendly location string.
+
+    Uses Google-supplied data only (subdivisionCode + regionCode from the
+    activity envelope's networkInfo block). No external geo-IP lookup.
+    """
+    sub = (network_info or {}).get("subdivisionCode") or ""
+    region = (network_info or {}).get("regionCode") or ""
+    if sub.startswith("US-"):
+        name = _US_SUBDIVISIONS.get(sub[3:])
+        return f"{sub} ({name})" if name else sub
+    if sub:
+        return sub  # Non-US subdivisions: raw ISO.
+    return region or ""
+
+
+def _param(event: dict, name: str) -> str:
+    for p in event.get("parameters") or []:
+        if p.get("name") == name:
+            v = p.get("value")
+            if v is None and p.get("boolValue") is not None:
+                v = "true" if p["boolValue"] else "false"
+            return v or ""
+    return ""
+
+
+def fetch_login_activity(creds, days: int, user_key: str):
+    svc = build("admin", "reports_v1", credentials=creds, cache_discovery=False)
+    start = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    req = svc.activities().list(
+        userKey=user_key,
+        applicationName="login",
+        startTime=start,
+        maxResults=1000,
+    )
+    while req is not None:
+        resp = req.execute()
+        for item in resp.get("items", []):
+            yield item
+        req = svc.activities().list_next(req, resp)
+
+
+SIGNIN_EVENTS = {"login_success", "login_failure"}
+CHALLENGE_EVENTS = {"login_challenge", "login_verification"}
+
+
+def flatten(
+    activities,
+    include_logout: bool,
+    include_challenges: bool,
+    failures_only: bool,
+) -> list[dict]:
+    """One row per (activity, event). No deduplication."""
+    rows: list[dict] = []
+    for activity in activities:
+        user = (activity.get("actor") or {}).get("email") or ""
+        time = (activity.get("id") or {}).get("time") or ""
+        ip = activity.get("ipAddress") or ""
+        location = render_location(activity.get("networkInfo") or {})
+        for ev in activity.get("events") or []:
+            name = ev.get("name") or ""
+            if name in SIGNIN_EVENTS:
+                pass
+            elif name == "logout":
+                if not include_logout:
+                    continue
+            elif name in CHALLENGE_EVENTS:
+                if not include_challenges:
+                    continue
+            else:
+                # Unknown / future event types — surface only when including
+                # challenges, otherwise skip to keep the default view tight.
+                if not include_challenges:
+                    continue
+            login_type = _param(ev, "login_type")
+            suspicious = _param(ev, "is_suspicious") == "true"
+            if failures_only and name != "login_failure" and not suspicious:
+                continue
+            rows.append({
+                "user": user,
+                "time": time,
+                "event": name,
+                "login_type": login_type,
+                "suspicious": suspicious,
+                "ip": ip,
+                "location": location,
+                "raw_event": ev,
+            })
+    return rows
+
+
+def render_table(rows: list[dict]) -> str:
+    def shrink(s: str, limit: int) -> str:
+        return s if len(s) <= limit else s[: limit - 1] + "…"
+
+    headers = ("USER", "TIME", "EVENT", "LOGIN_TYPE", "SUSPICIOUS", "IP", "LOCATION")
+    tabular = [
+        (
+            r["user"] or "-",
+            r["time"] or "-",
+            r["event"] or "-",
+            r["login_type"] or "-",
+            "true" if r["suspicious"] else "-",
+            shrink(r["ip"] or "-", 39),
+            r["location"] or "-",
+        )
+        for r in rows
+    ]
+    widths = [
+        max(len(str(row[i])) for row in (tabular + [headers]))
+        for i in range(len(headers))
+    ]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    lines = [fmt.format(*headers), fmt.format(*("-" * w for w in widths))]
+    lines.extend(fmt.format(*r) for r in tabular)
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--json", action="store_true", help="Dump raw JSON instead of a table.")
+    p.add_argument(
+        "--days", type=int, default=30,
+        help="Lookback window in days (default: 30).",
+    )
+    p.add_argument(
+        "--user",
+        help="Restrict to a single user email (default: all users in tenant).",
+    )
+    p.add_argument(
+        "--failures-only", action="store_true",
+        help="Show only login_failure events plus any successes with is_suspicious=true.",
+    )
+    p.add_argument(
+        "--suspicious-only", action="store_true",
+        help="Show only events flagged is_suspicious=true (any event type).",
+    )
+    p.add_argument(
+        "--include-logout", action="store_true",
+        help="Include logout events (off by default — they double row count without sign-in-source info).",
+    )
+    p.add_argument(
+        "--include-challenges", action="store_true",
+        help="Include login_challenge / login_verification / other non-sign-in events.",
+    )
+    args = p.parse_args()
+
+    try:
+        sa_email = os.environ["SA_EMAIL"]
+        admin_email = os.environ["WORKSPACE_ADMIN_EMAIL"]
+    except KeyError as exc:
+        print(f"Missing required env var: {exc.args[0]}", file=sys.stderr)
+        print("  export SA_EMAIL=endpoint-security-reader@<PROJECT>.iam.gserviceaccount.com", file=sys.stderr)
+        print("  export WORKSPACE_ADMIN_EMAIL=<a super-admin in your tenant>", file=sys.stderr)
+        return 2
+
+    creds = build_credentials(sa_email, admin_email, SCOPES)
+    activities = fetch_login_activity(creds, args.days, args.user or "all")
+    rows = flatten(
+        activities,
+        include_logout=args.include_logout,
+        include_challenges=args.include_challenges,
+        failures_only=args.failures_only,
+    )
+    if args.suspicious_only:
+        rows = [r for r in rows if r["suspicious"]]
+    rows.sort(key=lambda r: r["time"], reverse=True)
+
+    if args.json:
+        json.dump(rows, sys.stdout, indent=2, sort_keys=True, default=str)
+        sys.stdout.write("\n")
+    else:
+        print(render_table(rows))
+        print(f"\n{len(rows)} sign-in event(s) over the last {args.days} day(s).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
