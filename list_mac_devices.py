@@ -6,19 +6,24 @@ domain-wide-delegated access token impersonating WORKSPACE_ADMIN_EMAIL.
 """
 from __future__ import annotations
 
+import time
+_T_MODULE_START = time.perf_counter()
+
 import argparse
 import json
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
 
 import google.auth
 from google.auth import iam
-from google.auth.transport.requests import AuthorizedSession, Request
+from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/cloud-identity.devices.readonly"]
+
+# Per-batch size for BatchHttpRequest. Google recommends <=50; hard cap is 1000.
+_BATCH_SIZE = 50
 
 
 def build_credentials(
@@ -62,16 +67,33 @@ def fetch_mac_device_users(svc) -> dict[str, list[dict]]:
     return by_device
 
 
-def fetch_device_full(session: AuthorizedSession, device_name: str) -> dict:
-    """devices.get() via raw HTTP so callers can parallelize.
+def _run_batch(svc, requests_by_id: dict[str, object]) -> dict[str, dict]:
+    """Execute a {request_id: HttpRequest} map via BatchHttpRequest in chunks.
 
-    The summary view returned by devices.list() strips out
-    endpointVerificationSpecificAttributes; only devices.get() returns it.
+    Returns {request_id: response_dict}. Raises on the first sub-request
+    error — matches the prior ThreadPoolExecutor behavior where any raise
+    in a worker propagated through `pool.map`.
     """
-    url = f"https://cloudidentity.googleapis.com/v1/{device_name}"
-    r = session.get(url)
-    r.raise_for_status()
-    return r.json()
+    results: dict[str, dict] = {}
+    errors: list[tuple[str, Exception]] = []
+
+    def cb(request_id, response, exception):
+        if exception is not None:
+            errors.append((request_id, exception))
+        else:
+            results[request_id] = response
+
+    items = list(requests_by_id.items())
+    for start in range(0, len(items), _BATCH_SIZE):
+        batch = svc.new_batch_http_request(callback=cb)
+        for rid, req in items[start:start + _BATCH_SIZE]:
+            batch.add(req, request_id=rid)
+        batch.execute()
+
+    if errors:
+        rid, exc = errors[0]
+        raise RuntimeError(f"batch sub-request {rid} failed: {exc}") from exc
+    return results
 
 
 def extract_browser(full_device: dict) -> str:
@@ -90,52 +112,34 @@ def extract_browser(full_device: dict) -> str:
     return ""
 
 
-def fetch_client_ids(session: AuthorizedSession, device_user_name: str) -> list[str]:
-    """List clientState entries under a DeviceUser and return their trailing IDs.
+def list_mac_devices(
+    creds: service_account.Credentials,
+    view: str,
+    with_clients: bool,
+    timing: dict | None = None,
+):
+    def record(label: str, t_start: float) -> None:
+        if timing is not None:
+            timing[label] = time.perf_counter() - t_start
 
-    A ClientState resource is named
-        devices/{device}/deviceUsers/{deviceUser}/clientStates/{partner}
-    where {partner} identifies a Context-Aware Access partner that has
-    registered signals (Crowdstrike, Jamf, custom partner integrations, ...).
-
-    Confirmed empirically (2026-05-29): first-party Google clients including
-    Endpoint Verification do NOT write entries here; this surface is for
-    3rd-party CAA partners only. For a tenant with no partner integrations
-    this list will always be empty, and that's expected.
-
-    Uses a raw AuthorizedSession (not the discovery client) so callers can
-    parallelize across DeviceUsers safely — httplib2 is not thread-safe.
-    """
-    ids: list[str] = []
-    url = f"https://cloudidentity.googleapis.com/v1/{device_user_name}/clientStates"
-    params: dict = {"customer": "customers/my_customer"}
-    while True:
-        r = session.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
-        for cs in data.get("clientStates", []):
-            name = cs.get("name", "")
-            tail = name.rsplit("/", 1)[-1] if name else ""
-            if tail:
-                ids.append(tail)
-        token = data.get("nextPageToken")
-        if not token:
-            return ids
-        params["pageToken"] = token
-
-
-def list_mac_devices(creds: service_account.Credentials, view: str, with_clients: bool):
+    t = time.perf_counter()
     svc = build(
         "cloudidentity", "v1",
         credentials=creds,
         cache_discovery=False,
         static_discovery=True,
     )
-    users_by_device = fetch_mac_device_users(svc)
+    record("discovery build", t)
 
-    # Collect summary records first so we can fan out devices.get() in parallel
-    # — the summary view from devices.list() strips out
-    # endpointVerificationSpecificAttributes, which is where browser info lives.
+    t = time.perf_counter()
+    users_by_device = fetch_mac_device_users(svc)
+    record("deviceUsers.list (all)", t)
+
+    # The summary view from devices.list() strips out
+    # endpointVerificationSpecificAttributes, which is where browser info lives,
+    # so we fan out devices.get() — via BatchHttpRequest, one HTTP envelope per
+    # chunk of _BATCH_SIZE, rather than N parallel single requests.
+    t = time.perf_counter()
     summaries: list[dict] = []
     req = svc.devices().list(
         customer="customers/my_customer",
@@ -146,23 +150,53 @@ def list_mac_devices(creds: service_account.Credentials, view: str, with_clients
         resp = req.execute()
         summaries.extend(resp.get("devices", []))
         req = svc.devices().list_next(req, resp)
+    record("devices.list", t)
 
-    session = AuthorizedSession(creds)
-
-    device_names = [d["name"] for d in summaries]
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        fulls = list(pool.map(lambda n: fetch_device_full(session, n), device_names))
-    full_by_name = dict(zip(device_names, fulls))
+    # request_ids must match googleapiclient's allowed charset, so use a short
+    # synthetic key (d0, d1, …) and key results back to the device name.
+    t = time.perf_counter()
+    get_requests = {
+        f"d{i}": svc.devices().get(name=d["name"])
+        for i, d in enumerate(summaries)
+    }
+    get_responses = _run_batch(svc, get_requests)
+    full_by_name = {
+        summaries[int(rid[1:])]["name"]: resp
+        for rid, resp in get_responses.items()
+    }
+    record(f"devices.get batched (n={len(summaries)})", t)
 
     client_ids_by_du: dict[str, list[str]] = {}
     if with_clients:
+        t = time.perf_counter()
+        # ClientState resources are named
+        #   devices/{device}/deviceUsers/{deviceUser}/clientStates/{partner}
+        # where {partner} is a Context-Aware Access partner (Crowdstrike, Jamf,
+        # …). Confirmed empirically: first-party Google clients including
+        # Endpoint Verification do NOT write entries here, so on a tenant with
+        # no CAA partner integrations every list will return empty.
+        #
+        # We don't paginate — in practice each DeviceUser has at most a handful
+        # of ClientStates (one per partner), well under the default page size.
         all_du_names = [u["name"] for du_list in users_by_device.values() for u in du_list]
-        with ThreadPoolExecutor(max_workers=10) as pool:
-            for du_name, ids in zip(
-                all_du_names,
-                pool.map(lambda n: fetch_client_ids(session, n), all_du_names),
-            ):
-                client_ids_by_du[du_name] = ids
+        cs_requests = {
+            f"c{i}": svc.devices().deviceUsers().clientStates().list(
+                parent=du_name,
+                customer="customers/my_customer",
+            )
+            for i, du_name in enumerate(all_du_names)
+        }
+        cs_responses = _run_batch(svc, cs_requests)
+        for rid, resp in cs_responses.items():
+            du_name = all_du_names[int(rid[1:])]
+            ids: list[str] = []
+            for cs in resp.get("clientStates", []) or []:
+                name = cs.get("name", "")
+                tail = name.rsplit("/", 1)[-1] if name else ""
+                if tail:
+                    ids.append(tail)
+            client_ids_by_du[du_name] = ids
+        record(f"clientStates.list batched (n={len(all_du_names)})", t)
 
     for d in summaries:
         full = full_by_name.get(d["name"], {})
@@ -170,7 +204,11 @@ def list_mac_devices(creds: service_account.Credentials, view: str, with_clients
         for k, v in full.items():
             d.setdefault(k, v)
         users = users_by_device.get(_device_id(d.get("name", "")), [])
-        d["userEmails"] = [u["userEmail"] for u in users if u.get("userEmail")]
+        # Dedupe: Google creates a new DeviceUser record per sign-in session,
+        # so a frequently-used device yields many records with the same email.
+        d["userEmails"] = list(dict.fromkeys(
+            u["userEmail"] for u in users if u.get("userEmail")
+        ))
         d["browser"] = extract_browser(full)
         if with_clients:
             seen: list[str] = []
@@ -252,6 +290,10 @@ def main() -> int:
              "Jamf, etc.) writing signals; first-party Google clients including "
              "Endpoint Verification do not appear here.",
     )
+    p.add_argument(
+        "--timing", action="store_true",
+        help="Print a per-phase wall-clock breakdown to stderr after the run.",
+    )
     args = p.parse_args()
 
     try:
@@ -263,15 +305,44 @@ def main() -> int:
         print("  export WORKSPACE_ADMIN_EMAIL=<admin with Mobile Device Management read privilege>", file=sys.stderr)
         return 2
 
-    creds = build_credentials(sa_email, admin_email, SCOPES)
-    devices = list(list_mac_devices(creds, args.view, args.clients))
+    timing: dict[str, float] | None = {} if args.timing else None
+    t_main_start = time.perf_counter()
+    if timing is not None:
+        timing["module import (post 'import time')"] = t_main_start - _T_MODULE_START
 
+    t = time.perf_counter()
+    creds = build_credentials(sa_email, admin_email, SCOPES)
+    if timing is not None:
+        timing["build_credentials (local)"] = time.perf_counter() - t
+
+    # Force the signJwt + token-exchange RTTs to happen NOW so they show up as
+    # their own phase, rather than getting folded into the first API call.
+    t = time.perf_counter()
+    creds.refresh(Request())
+    if timing is not None:
+        timing["auth refresh (signJwt + token)"] = time.perf_counter() - t
+
+    devices = list(list_mac_devices(creds, args.view, args.clients, timing=timing))
+
+    t = time.perf_counter()
     if args.json:
         json.dump(devices, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
     else:
         print(render_table(devices, args.clients))
         print(f"\n{len(devices)} Mac device(s).")
+    if timing is not None:
+        timing["render + print"] = time.perf_counter() - t
+        wall = time.perf_counter() - _T_MODULE_START
+        width = max(len(k) for k in timing)
+        print("\n--- timing (stderr) ---", file=sys.stderr)
+        for k, v in timing.items():
+            print(f"  {k:<{width}}  {v*1000:8.1f} ms", file=sys.stderr)
+        phases_total = sum(timing.values())
+        print(f"  {'-' * width}  --------", file=sys.stderr)
+        print(f"  {'phases total':<{width}}  {phases_total*1000:8.1f} ms", file=sys.stderr)
+        print(f"  {'wall (post import time)':<{width}}  {wall*1000:8.1f} ms", file=sys.stderr)
+        print(f"  (interpreter+import-time startup not included in either)", file=sys.stderr)
     return 0
 
 
