@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import google.auth
 from google.auth import iam
@@ -49,12 +50,19 @@ def _device_id(resource_name: str) -> str:
 
 
 def fetch_mac_device_users(svc) -> dict[str, list[dict]]:
-    """deviceId -> [{'name', 'userEmail'}, ...] for every Mac DeviceUser, in one pass."""
+    """deviceId -> [{'name', 'userEmail'}, ...] for every Mac DeviceUser, in one pass.
+
+    Uses a `fields` projection mask to return only the two attributes the caller
+    actually needs. DeviceUser records carry many large nested fields by
+    default; trimming the response payload is the biggest single lever on this
+    call's wall time when the tenant has accumulated lots of session history.
+    """
     by_device: dict[str, list[dict]] = {}
     req = svc.devices().deviceUsers().list(
         parent="devices/-",
         customer="customers/my_customer",
         filter="type:mac",
+        fields="deviceUsers(name,userEmail),nextPageToken",
     )
     while req is not None:
         resp = req.execute()
@@ -122,6 +130,10 @@ def list_mac_devices(
         if timing is not None:
             timing[label] = time.perf_counter() - t_start
 
+    # Two service instances so deviceUsers.list and devices.list can run on
+    # separate threads — httplib2 (under the discovery client) is not
+    # thread-safe per-instance, so we don't want both threads sharing one svc.
+    # static_discovery=True keeps each build() ~4ms (no network).
     t = time.perf_counter()
     svc = build(
         "cloudidentity", "v1",
@@ -129,28 +141,50 @@ def list_mac_devices(
         cache_discovery=False,
         static_discovery=True,
     )
-    record("discovery build", t)
-
-    t = time.perf_counter()
-    users_by_device = fetch_mac_device_users(svc)
-    record("deviceUsers.list (all)", t)
+    svc2 = build(
+        "cloudidentity", "v1",
+        credentials=creds,
+        cache_discovery=False,
+        static_discovery=True,
+    )
+    record("discovery build (x2)", t)
 
     # The summary view from devices.list() strips out
     # endpointVerificationSpecificAttributes, which is where browser info lives,
-    # so we fan out devices.get() — via BatchHttpRequest, one HTTP envelope per
-    # chunk of _BATCH_SIZE, rather than N parallel single requests.
+    # so we fan out devices.get() afterwards. We also only need each device's
+    # `name` from devices.list (we re-fetch the full record), so trim the
+    # payload with a `fields` mask.
+    def _fetch_summaries() -> tuple[list[dict], float]:
+        t0 = time.perf_counter()
+        out: list[dict] = []
+        req = svc2.devices().list(
+            customer="customers/my_customer",
+            filter="type:mac",
+            view=view,
+            fields="devices(name),nextPageToken",
+        )
+        while req is not None:
+            resp = req.execute()
+            out.extend(resp.get("devices", []))
+            req = svc2.devices().list_next(req, resp)
+        return out, time.perf_counter() - t0
+
+    def _fetch_users() -> tuple[dict[str, list[dict]], float]:
+        t0 = time.perf_counter()
+        out = fetch_mac_device_users(svc)
+        return out, time.perf_counter() - t0
+
     t = time.perf_counter()
-    summaries: list[dict] = []
-    req = svc.devices().list(
-        customer="customers/my_customer",
-        filter="type:mac",
-        view=view,
-    )
-    while req is not None:
-        resp = req.execute()
-        summaries.extend(resp.get("devices", []))
-        req = svc.devices().list_next(req, resp)
-    record("devices.list", t)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_users = pool.submit(_fetch_users)
+        f_summaries = pool.submit(_fetch_summaries)
+        users_by_device, users_elapsed = f_users.result()
+        summaries, summaries_elapsed = f_summaries.result()
+    parallel_wall = time.perf_counter() - t
+    if timing is not None:
+        timing["[parallel] deviceUsers.list"] = users_elapsed
+        timing["[parallel] devices.list"] = summaries_elapsed
+        timing["[parallel] section wall"] = parallel_wall
 
     # request_ids must match googleapiclient's allowed charset, so use a short
     # synthetic key (d0, d1, …) and key results back to the device name.
@@ -291,6 +325,16 @@ def main() -> int:
              "Endpoint Verification do not appear here.",
     )
     p.add_argument(
+        "--exclude-stale", action="store_true",
+        help="Drop devices the classifier labels 'stale / minimal' (no serial, "
+             "no encryption state — typically dormant records with no recent signal).",
+    )
+    p.add_argument(
+        "--require-serial", action="store_true",
+        help="Drop devices with no serialNumber (a stricter cut than "
+             "--exclude-stale; also drops 'browser only' records).",
+    )
+    p.add_argument(
         "--timing", action="store_true",
         help="Print a per-phase wall-clock breakdown to stderr after the run.",
     )
@@ -323,6 +367,10 @@ def main() -> int:
         timing["auth refresh (signJwt + token)"] = time.perf_counter() - t
 
     devices = list(list_mac_devices(creds, args.view, args.clients, timing=timing))
+    if args.exclude_stale:
+        devices = [d for d in devices if classify_signals(d) != "stale / minimal"]
+    if args.require_serial:
+        devices = [d for d in devices if d.get("serialNumber")]
 
     t = time.perf_counter()
     if args.json:
@@ -338,9 +386,15 @@ def main() -> int:
         print("\n--- timing (stderr) ---", file=sys.stderr)
         for k, v in timing.items():
             print(f"  {k:<{width}}  {v*1000:8.1f} ms", file=sys.stderr)
-        phases_total = sum(timing.values())
+        # The two individual [parallel] entries overlap each other and are
+        # subsumed by [parallel] section wall — don't double-count them in the
+        # phases total.
+        phases_total = sum(
+            v for k, v in timing.items()
+            if not (k.startswith("[parallel]") and k != "[parallel] section wall")
+        )
         print(f"  {'-' * width}  --------", file=sys.stderr)
-        print(f"  {'phases total':<{width}}  {phases_total*1000:8.1f} ms", file=sys.stderr)
+        print(f"  {'phases total (no parallel overlap)':<{width}}  {phases_total*1000:8.1f} ms", file=sys.stderr)
         print(f"  {'wall (post import time)':<{width}}  {wall*1000:8.1f} ms", file=sys.stderr)
         print(f"  (interpreter+import-time startup not included in either)", file=sys.stderr)
     return 0
