@@ -204,11 +204,18 @@ def fetch_user_device_users(
 ) -> tuple[dict[str, list[dict]], bool]:
     """Return ({device_id: [DeviceUser, ...]}, server_side_filtered) for one user.
 
-    Mirrors `fetch_mac_device_users()` but restricted to a single user. Tries
-    an AIP-160 `email:` filter server-side first; on HTTP 400 (filter syntax
-    rejected) falls back to the bulk listing with client-side filter. Either
-    way the result is the deviceId → DeviceUser map the rest of the pipeline
-    expects.
+    `devices.deviceUsers.list` defers its `filter` semantics to the Admin SDK
+    "Mobile device search fields" (per
+    https://docs.cloud.google.com/identity/docs/reference/rest/v1/devices.deviceUsers/list).
+    On that surface, multiple operators are **space-separated**, not joined
+    with `AND` — we initially used `type:mac AND email:<X>` and the API
+    silently returned zero rows. The correct form is `type:mac email:<X>`.
+
+    Server-side success is verified by also requiring a case-insensitive
+    client-side match before keeping a row; if the API still returns nothing
+    (e.g., for a tenant where the filter semantics regress), we fall back to
+    the bulk listing + client-side filter so the script never silently
+    under-counts.
     """
     target = user_email.lower()
     by_device: dict[str, list[dict]] = {}
@@ -217,14 +224,12 @@ def fetch_user_device_users(
         req = svc.devices().deviceUsers().list(
             parent="devices/-",
             customer="customers/my_customer",
-            filter=f"type:mac AND email:{user_email}",
+            filter=f"type:mac email:{user_email}",
             fields="deviceUsers(name,userEmail),nextPageToken",
         )
         while req is not None:
             resp = _execute(req)
             for du in resp.get("deviceUsers") or []:
-                # Defensive: if the server filter widens, still require an
-                # exact (case-insensitive) email match client-side.
                 if (du.get("userEmail") or "").lower() != target:
                     continue
                 device_id = _device_id(du.get("name", ""))
@@ -235,15 +240,18 @@ def fetch_user_device_users(
                     "userEmail": du.get("userEmail", ""),
                 })
             req = svc.devices().deviceUsers().list_next(req, resp)
-        return by_device, True
+        if by_device:
+            return by_device, True
+        # Server returned zero — verify by bulk before reporting "no devices".
     except HttpError as exc:
         if _http_status(exc) != 400:
             raise
-        # Filter rejected — fall through.
+        # Filter rejected — fall through to bulk.
 
-    # Fallback: bulk listing + client-side filter.
-    bulk = fetch_mac_device_users(svc)
-    for dev_id, dus in bulk.items():
+    # Fallback: bulk listing + client-side filter (also our verification path
+    # when the server filter returned zero rows).
+    by_device = {}
+    for dev_id, dus in fetch_mac_device_users(svc).items():
         filtered = [u for u in dus if (u.get("userEmail") or "").lower() == target]
         if filtered:
             by_device[dev_id] = filtered
@@ -342,15 +350,17 @@ def list_mac_devices(
     #   users_by_device  — deviceId → [DeviceUser, ...] for user attribution
     #   full_by_name     — device name → full record (for EV browser attribute)
     if user_email:
-        # Focused path: --user is set. Skip devices.list entirely. Fetch only
-        # this user's DeviceUsers (server-side email filter where the API
-        # supports it), then devices.get on those device IDs — which returns
-        # full records including all the fields devices.list would have given
-        # us. Massive overhead reduction on noisy tenants.
+        # Focused path: --user is set. Skip devices.list entirely. Try the
+        # server-side `type:mac email:<X>` filter on deviceUsers.list — if it
+        # returns rows, we paid for one targeted call. If it silently returns
+        # zero (some tenants regress to broken semantics), we fall back to the
+        # bulk listing + client-side filter so the script never under-counts.
+        # Then devices.get on the resulting device IDs — which returns full
+        # records including all the fields devices.list would have given us.
         t = time.perf_counter()
         users_by_device, server_filtered = fetch_user_device_users(svc, user_email)
         record(
-            f"deviceUsers.list for user ({'server' if server_filtered else 'client'}-filter)",
+            f"deviceUsers.list for user ({'server' if server_filtered else 'bulk'}-filter)",
             t,
         )
         device_names = [f"devices/{dev_id}" for dev_id in users_by_device]
