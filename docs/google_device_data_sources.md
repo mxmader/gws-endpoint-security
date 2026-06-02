@@ -153,10 +153,20 @@ Defaults:
    email Cloud Identity has attributed to any record sharing that serial.
 
 This default reflects "the active managed fleet, one row per physical
-Mac." For audits of dormant or signal-poor records (no serial, very old
-sync, `stale / minimal` classifier), a future sibling script will surface
-the inverse view — that's intentionally not this script's job, so its
-defaults don't drift toward exhaustive enumeration.
+Mac." Within the filtered set, rows are sorted so non-`ENCRYPTED` Macs
+appear first — at-risk records are the top of the report and impossible
+to miss.
+
+Two companion scripts handle the inverse / user-centric views:
+
+- **`prune_devices.py`** deletes the records this script filters out:
+  any Mac with `lastSyncTime` older than 30 days (configurable), and any
+  device of any type with no `serialNumber`. Dry-run by default;
+  `--execute` opts in to actual `devices.delete` calls.
+- **`list_users_with_macs.py`** pivots to a per-user view, surfacing
+  Workspace users with **no Mac associated** (top of its sort) before
+  users with at least one unencrypted Mac, then users with all-encrypted
+  Macs.
 
 ## Signal-mix classifier (what shows up in the `SIGNALS` column)
 
@@ -170,11 +180,13 @@ defaults don't drift toward exhaustive enumeration.
 
 ## Sample output (default filter)
 
+Sort puts non-`ENCRYPTED` rows first; encrypted rows follow.
+
 ```
 USER                              SIGNALS             SERIAL         MODEL        ASSET_TAG  ENCRYPTION  LAST_SYNC
 --------------------------------  ------------------  -------------  -----------  ---------  ----------  ------------------------
-alice@example.com                 browser + hardware  C02ZZZZZZZZZ1  MacBook Pro  -          ENCRYPTED   2026-05-29T18:19:07.448Z
 bob@example.com, eve@example.com  hardware only       C02ZZZZZZZZZ2  Mac16,6      -          -           2026-05-29T16:02:30.005Z
+alice@example.com                 browser + hardware  C02ZZZZZZZZZ1  MacBook Pro  -          ENCRYPTED   2026-05-29T18:19:07.448Z
 ```
 
 Add `--include-browser` to pull each device's Chrome version (from the EV
@@ -184,18 +196,21 @@ per surviving device.
 Reading this:
 
 - One row per physical Mac (deduped by `serialNumber`).
+- **bob's** Mac (top of the sort because it's not reporting `ENCRYPTED`)
+  is shared with **eve** (both have synced into it under managed
+  identities); Drive for desktop is reporting the serial, but nothing on
+  this machine is reporting encryption state. **Action item:** install EV
+  so FileVault status surfaces.
 - **alice's** Mac has the EV extension *and* native helper, so a single
   record carries both `serialNumber` and `encryptionState` and we know
   FileVault is on.
-- **bob's** Mac is shared with **eve** (both have synced into it under
-  managed identities); Drive for desktop is reporting the serial, but
-  nothing on this machine is reporting encryption state. **Action item:**
-  install EV on this machine so FileVault status surfaces.
 - Records that fail the default filter — no serial (browser-only Chrome
   sessions like alice's older MacBookPro17,1, or carol/dave's machines
   that only have managed Chrome), or sync older than 30 days, or the
   classic `stale / minimal` model="Mac OS" placeholders — are dropped
-  from this view. A future "outliers" report will surface them.
+  from this view. `prune_devices.py` is the script that physically
+  deletes them; `list_users_with_macs.py --only-no-mac` is the place to
+  see the users they left behind.
 
 ## Practical implications
 

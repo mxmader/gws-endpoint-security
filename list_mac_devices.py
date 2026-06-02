@@ -2,13 +2,15 @@
 """List active Mac devices in the Workspace tenant with their encryption status.
 
 By default surfaces only devices that (a) report a serial number and (b) have
-synced in the last 30 days, deduped by serial. The Cloud Identity Devices API
-holds many records per physical Mac (per user / app / OS version / login
-vector); without filtering, a noisy tenant easily exceeds the
-`devices_read_requests` quota (1500/min). Use `--last-sync-days N` to widen
-the window; use `--include-browser` to pull each survivor's Chrome version
-from the EV signal block — at the cost of one extra `devices.get` call per
-surviving device.
+synced in the last 30 days, deduped by serial. Rows are sorted so
+non-ENCRYPTED Macs appear first — at-risk records are eye-scannable. The
+Cloud Identity Devices API holds many records per physical Mac (per user /
+app / OS version / login vector); without filtering, a noisy tenant easily
+exceeds the `devices_read_requests` quota (1500/min). Use `--last-sync-days
+N` to widen the window; use `--include-browser` to pull each survivor's
+Chrome version from the EV signal block — at the cost of one extra
+`devices.get` call per surviving device. Use `--format json|csv` and
+`--output PATH` for non-interactive consumption.
 
 Auth: keyless. Uses your local gcloud ADC + the IAM signJwt API to mint a
 domain-wide-delegated access token impersonating WORKSPACE_ADMIN_EMAIL.
@@ -19,13 +21,14 @@ import time
 _T_MODULE_START = time.perf_counter()
 
 import argparse
+import csv
 import json
 import os
 import random
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from typing import Callable, Sequence
 
 import google.auth
 from google.auth import iam
@@ -123,13 +126,19 @@ def _execute(req):
 
 
 def _run_batch(
-    svc, request_factories: dict[str, Callable[[], object]]
+    svc,
+    request_factories: dict[str, Callable[[], object]],
+    ignore_statuses: frozenset[int] | set[int] = frozenset(),
 ) -> dict[str, dict]:
     """Execute {request_id: factory()} via BatchHttpRequest with per-sub-request retry.
 
     Factories (not pre-built HttpRequest objects) so each retry can mint a fresh
     request — googleapiclient's HttpRequest is not guaranteed re-executable
     after an error. Retries only the failing sub-requests, not the whole batch.
+
+    `ignore_statuses` — HTTP statuses (e.g. {404}) treated as success rather
+    than fatal. The sub-request's result becomes `{}`. Useful for idempotent
+    deletes where "already gone" is the desired state.
     """
     results: dict[str, dict] = {}
     pending: dict[str, Callable[[], object]] = dict(request_factories)
@@ -146,6 +155,8 @@ def _run_batch(
             nonlocal fatal
             if exception is None:
                 results[request_id] = response
+            elif _http_status(exception) in ignore_statuses:
+                results[request_id] = {}
             elif _is_retryable(exception):
                 retry_pending[request_id] = pending[request_id]
                 retry_excs.append(exception)
@@ -438,7 +449,27 @@ def classify_signals(d: dict) -> str:
     return "unknown"
 
 
-def render_table(devices: list[dict], with_clients: bool, include_browser: bool) -> str:
+def encryption_sort_key(d: dict) -> tuple:
+    """Sort survivor Macs so unencrypted records surface first.
+
+    Group 0: encryptionState != "ENCRYPTED" (gaps to fix).
+    Group 1: encryptionState == "ENCRYPTED" (clean).
+    Within each group: by primary userEmail then serialNumber.
+    """
+    enc = (d.get("encryptionState") or "").upper()
+    group = 1 if enc == "ENCRYPTED" else 0
+    emails = d.get("userEmails") or []
+    primary_email = emails[0] if emails else ""
+    serial = d.get("serialNumber") or ""
+    return (group, primary_email, serial)
+
+
+def _table_columns(devices: list[dict], with_clients: bool, include_browser: bool):
+    """Compute (headers, rows-as-tuples) for the survivor Mac table.
+
+    Shared between the plain-text table renderer and the CSV writer so the
+    column set stays identical across formats.
+    """
     def row(d: dict) -> tuple:
         base: tuple = (", ".join(d.get("userEmails") or []) or "-",)
         if include_browser:
@@ -455,15 +486,25 @@ def render_table(devices: list[dict], with_clients: bool, include_browser: bool)
             return base + (", ".join(d.get("clientIds") or []) or "-",)
         return base
 
-    rows = [row(d) for d in devices]
     headers: tuple = ("USER",)
     if include_browser:
         headers = headers + ("BROWSER",)
     headers = headers + ("SIGNALS", "SERIAL", "MODEL", "ASSET_TAG", "ENCRYPTION", "LAST_SYNC")
     if with_clients:
         headers = headers + ("CLIENTS",)
+    rows = [row(d) for d in devices]
+    return headers, rows
+
+
+def render_table(devices: list[dict], with_clients: bool, include_browser: bool) -> str:
+    headers, rows = _table_columns(devices, with_clients, include_browser)
+    return _format_plain(headers, rows)
+
+
+def _format_plain(headers: Sequence[str], rows: Sequence[Sequence]) -> str:
+    """Pretty-print headers + rows as a fixed-width column table."""
     widths = [
-        max(len(str(r[i])) for r in (rows + [headers]))
+        max(len(str(r[i])) for r in (list(rows) + [list(headers)]))
         for i in range(len(headers))
     ]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
@@ -472,9 +513,52 @@ def render_table(devices: list[dict], with_clients: bool, include_browser: bool)
     return "\n".join(lines)
 
 
+def write_formatted(
+    fmt: str,
+    output_path: str | None,
+    *,
+    plain_text: str,
+    rows_for_json: list[dict],
+    csv_headers: Sequence[str],
+    csv_rows: Sequence[Sequence],
+) -> None:
+    """Dispatch on `fmt` and write to stdout or `output_path`.
+
+    Callers pre-compute the three representations (string for `plain`, dict
+    list for `json`, header + row sequences for `csv`) and pass them in. Keeps
+    the dispatcher trivial and lets each script wire its own column logic.
+    """
+    fh = open(output_path, "w", newline="") if output_path else sys.stdout
+    try:
+        if fmt == "plain":
+            print(plain_text, file=fh)
+        elif fmt == "json":
+            json.dump(rows_for_json, fh, indent=2, sort_keys=True, default=str)
+            fh.write("\n")
+        elif fmt == "csv":
+            writer = csv.writer(fh)
+            writer.writerow(csv_headers)
+            for row in csv_rows:
+                writer.writerow(row)
+        else:
+            raise ValueError(f"unknown format: {fmt}")
+    finally:
+        if output_path:
+            fh.close()
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--json", action="store_true", help="Dump raw JSON instead of a table.")
+    p.add_argument(
+        "--format", choices=["plain", "json", "csv"], default="plain",
+        help="Output format (default: plain). `json` mirrors the existing JSON "
+             "structure; `csv` writes a header row and quote-escapes commas.",
+    )
+    p.add_argument(
+        "--output", metavar="PATH",
+        help="Write the formatted output to a file at PATH instead of stdout. "
+             "--timing output continues to go to stderr.",
+    )
     p.add_argument(
         "--view",
         choices=["USER_ASSIGNED_DEVICES", "COMPANY_INVENTORY"],
@@ -548,17 +632,24 @@ def main() -> int:
         include_browser=args.include_browser,
         timing=timing,
     ))
+    # Surface unencrypted Macs at the top; encrypted ones at the bottom.
+    devices.sort(key=encryption_sort_key)
 
     t = time.perf_counter()
-    if args.json:
-        json.dump(devices, sys.stdout, indent=2, sort_keys=True)
-        sys.stdout.write("\n")
-    else:
-        print(render_table(devices, args.clients, args.include_browser))
-        print(
-            f"\n{len(devices)} Mac device(s) "
+    headers, rows = _table_columns(devices, args.clients, args.include_browser)
+    plain_text = _format_plain(headers, rows)
+    if args.format == "plain" and not args.output:
+        plain_text = (
+            f"{plain_text}\n\n{len(devices)} Mac device(s) "
             f"active in the last {args.last_sync_days} day(s) with a serial number."
         )
+    write_formatted(
+        args.format, args.output,
+        plain_text=plain_text,
+        rows_for_json=devices,
+        csv_headers=headers,
+        csv_rows=rows,
+    )
     if timing is not None:
         timing["render + print"] = time.perf_counter() - t
         wall = time.perf_counter() - _T_MODULE_START

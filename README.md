@@ -6,9 +6,19 @@ with domain-wide delegation:
 - [`list_mac_devices.py`](./list_mac_devices.py) — active Macs (synced in
   the trailing 30 days, with a serial number, deduped by serial) with their
   encryption status (FileVault), signal mix, etc., from the Cloud Identity
-  Devices API. Tune the window via `--last-sync-days N`; add the BROWSER
-  column (Chrome version, one extra `devices.get` per device) via
-  `--include-browser`.
+  Devices API. Rows sorted with non-`ENCRYPTED` Macs first. Tune the window
+  via `--last-sync-days N`; add the BROWSER column (Chrome version, one
+  extra `devices.get` per device) via `--include-browser`.
+- [`list_users_with_macs.py`](./list_users_with_macs.py) — every active
+  Workspace user, correlated against the Mac survivor set. Rows sorted to
+  surface users with **no Mac**, then users with at least one unencrypted
+  Mac, then users with all-encrypted Macs. `--include-suspended`,
+  `--only-no-mac` available.
+- [`prune_devices.py`](./prune_devices.py) — **the only script that
+  writes.** Dry-runs by default; lists devices that match the prune rules
+  (Macs synced >30 days ago, or any device with no serial). `--execute`
+  actually calls `devices.delete` (batched, with idempotent 404 handling
+  and 429 retry).
 - [`list_app_authorizations.py`](./list_app_authorizations.py) — every
   OAuth-authorized app per user (Drive desktop, Slack, Outlook, …) from the
   Admin SDK Reports `token` activity log.
@@ -62,12 +72,21 @@ ID and the **comma-separated** scope list `setup.sh` printed:
 
 ```
 https://www.googleapis.com/auth/cloud-identity.devices.readonly,
-https://www.googleapis.com/auth/admin.reports.audit.readonly
+https://www.googleapis.com/auth/admin.reports.audit.readonly,
+https://www.googleapis.com/auth/cloud-identity.devices,
+https://www.googleapis.com/auth/admin.directory.user.readonly
 ```
 
-The first scope powers `list_mac_devices.py`; the second powers
-`list_app_authorizations.py` and `list_signins.py`. Wait ~2 minutes for
-propagation.
+What each scope powers:
+
+- `cloud-identity.devices.readonly` — `list_mac_devices.py`,
+  `list_users_with_macs.py` (Mac correlation).
+- `admin.reports.audit.readonly` — `list_app_authorizations.py`,
+  `list_signins.py`.
+- `cloud-identity.devices` (write) — `prune_devices.py`.
+- `admin.directory.user.readonly` — `list_users_with_macs.py` (user list).
+
+Wait ~2 minutes for propagation.
 
 ## `WORKSPACE_ADMIN_EMAIL` — what privileges does it need?
 
@@ -79,10 +98,13 @@ Read-Only" custom admin role assigned to a service-style account.
 | Script | Required admin-role privilege |
 |---|---|
 | `list_mac_devices.py` | Services → **Mobile Device Management** (Read) |
+| `list_users_with_macs.py` | Services → **Mobile Device Management** (Read) + Admin API Privileges → **Users** (Read) |
+| `prune_devices.py` | Services → **Mobile Device Management** (full — *not* the Read-only sub-privilege) |
 | `list_app_authorizations.py` | Admin API Privileges → **Reports** (Read) |
 | `list_signins.py` | Admin API Privileges → **Reports** (Read) |
 
-A single role with both privileges covers all three scripts. The only
+A single role bundling all of these (full Mobile Device Management +
+Users (Read) + Reports (Read)) covers every script. The only
 *super-admin*-only thing in the whole flow is the one-time DWD entry above.
 
 ## Run the reports
@@ -93,15 +115,18 @@ uv sync
 export SA_EMAIL=endpoint-security-reader@<PROJECT>.iam.gserviceaccount.com
 export WORKSPACE_ADMIN_EMAIL=security-reader@yourdomain.com  # see privilege table above
 
-uv run python list_mac_devices.py                   # all Macs + encryption status
+uv run python list_mac_devices.py                   # active Macs + encryption
+uv run python list_users_with_macs.py               # users -> Macs correlation
 uv run python list_app_authorizations.py --days 30  # OAuth app grants, last 30 days
 uv run python list_signins.py --days 7              # sign-in events with IP + method
+uv run python prune_devices.py                      # DRY RUN of prune candidates
+uv run python prune_devices.py --execute            # actually delete
 ```
 
-All three scripts accept `--json` for raw output. See `--help` on each for
-other flags (`--last-sync-days`, `--include-browser`, `--clients`,
-`--view`, `--user`, `--show-revoked`, `--failures-only`,
-`--suspicious-only`, …).
+`list_mac_devices.py`, `list_users_with_macs.py`, and `prune_devices.py`
+accept `--format {plain,json,csv}` and `--output PATH` for non-interactive
+consumption. The Reports scripts still accept `--json` (out of scope of the
+recent rework). See `--help` on each for the full flag set.
 
 ## How auth works (no key file)
 

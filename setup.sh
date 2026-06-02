@@ -8,6 +8,8 @@ SA_DISPLAY="Endpoint Security Reader"
 SCOPES=(
   "https://www.googleapis.com/auth/cloud-identity.devices.readonly"
   "https://www.googleapis.com/auth/admin.reports.audit.readonly"
+  "https://www.googleapis.com/auth/cloud-identity.devices"
+  "https://www.googleapis.com/auth/admin.directory.user.readonly"
 )
 DWD_URL="https://admin.google.com/ac/owl/domainwidedelegation"
 
@@ -123,10 +125,12 @@ Click "Add new" (or edit the existing entry for this Client ID) and enter:
 To run the reports once DWD is set up:
 
   export SA_EMAIL="${SA_EMAIL}"
-  export WORKSPACE_ADMIN_EMAIL="<admin with the right read privileges; see README>"
+  export WORKSPACE_ADMIN_EMAIL="<admin with the right privileges; see README>"
   uv run python list_mac_devices.py
   uv run python list_app_authorizations.py --days 30
   uv run python list_signins.py --days 7
+  uv run python list_users_with_macs.py
+  uv run python prune_devices.py                # dry-run; add --execute to delete
 
 EOF
 
