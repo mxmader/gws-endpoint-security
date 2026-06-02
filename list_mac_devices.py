@@ -49,29 +49,39 @@ def _device_id(resource_name: str) -> str:
     return parts[1] if len(parts) >= 2 and parts[0] == "devices" else ""
 
 
-def fetch_mac_device_users(svc) -> dict[str, list[dict]]:
-    """deviceId -> [{'name', 'userEmail'}, ...] for every Mac DeviceUser, in one pass.
+def fetch_device_users_per_device(
+    svc, device_names: list[str]
+) -> dict[str, list[dict]]:
+    """deviceId -> [{'name', 'userEmail'}, ...] via per-device deviceUsers.list, batched.
 
-    Uses a `fields` projection mask to return only the two attributes the caller
-    actually needs. DeviceUser records carry many large nested fields by
-    default; trimming the response payload is the biggest single lever on this
-    call's wall time when the tenant has accumulated lots of session history.
+    Replaces the bulk `parent="devices/-"` paginated call. For tenants with
+    accumulated session history the bulk call's server-side cost (filtering
+    and paginating thousands of records) dominates; per-device calls operate
+    on a smaller working set each, and 50 fit in a single batch envelope.
+
+    Does not handle nextPageToken — in practice a single device's session
+    history fits comfortably in the default page. If we ever see this in the
+    wild we'll fall back to a paginated tail for those devices.
     """
+    if not device_names:
+        return {}
+    requests = {
+        f"u{i}": svc.devices().deviceUsers().list(
+            parent=name,
+            customer="customers/my_customer",
+            fields="deviceUsers(name,userEmail),nextPageToken",
+        )
+        for i, name in enumerate(device_names)
+    }
+    responses = _run_batch(svc, requests)
     by_device: dict[str, list[dict]] = {}
-    req = svc.devices().deviceUsers().list(
-        parent="devices/-",
-        customer="customers/my_customer",
-        filter="type:mac",
-        fields="deviceUsers(name,userEmail),nextPageToken",
-    )
-    while req is not None:
-        resp = req.execute()
-        for du in resp.get("deviceUsers", []):
-            by_device.setdefault(_device_id(du.get("name", "")), []).append({
-                "name": du.get("name", ""),
-                "userEmail": du.get("userEmail", ""),
-            })
-        req = svc.devices().deviceUsers().list_next(req, resp)
+    for rid, resp in responses.items():
+        device_name = device_names[int(rid[1:])]
+        device_id = _device_id(device_name)
+        by_device[device_id] = [
+            {"name": du.get("name", ""), "userEmail": du.get("userEmail", "")}
+            for du in (resp.get("deviceUsers") or [])
+        ]
     return by_device
 
 
@@ -130,7 +140,7 @@ def list_mac_devices(
         if timing is not None:
             timing[label] = time.perf_counter() - t_start
 
-    # Two service instances so deviceUsers.list and devices.list can run on
+    # Two service instances so the two batched fan-outs below can run on
     # separate threads — httplib2 (under the discovery client) is not
     # thread-safe per-instance, so we don't want both threads sharing one svc.
     # static_discovery=True keeps each build() ~4ms (no network).
@@ -149,56 +159,57 @@ def list_mac_devices(
     )
     record("discovery build (x2)", t)
 
-    # The summary view from devices.list() strips out
-    # endpointVerificationSpecificAttributes, which is where browser info lives,
-    # so we fan out devices.get() afterwards. We also only need each device's
-    # `name` from devices.list (we re-fetch the full record), so trim the
-    # payload with a `fields` mask.
-    def _fetch_summaries() -> tuple[list[dict], float]:
-        t0 = time.perf_counter()
-        out: list[dict] = []
-        req = svc2.devices().list(
-            customer="customers/my_customer",
-            filter="type:mac",
-            view=view,
-            fields="devices(name),nextPageToken",
-        )
-        while req is not None:
-            resp = req.execute()
-            out.extend(resp.get("devices", []))
-            req = svc2.devices().list_next(req, resp)
-        return out, time.perf_counter() - t0
+    # Step 1: devices.list — we need device names before we can fan out the
+    # per-device deviceUsers.list and devices.get calls. fields mask trims the
+    # payload to just `name` since we re-fetch the full record via devices.get.
+    t = time.perf_counter()
+    summaries: list[dict] = []
+    req = svc.devices().list(
+        customer="customers/my_customer",
+        filter="type:mac",
+        view=view,
+        fields="devices(name),nextPageToken",
+    )
+    while req is not None:
+        resp = req.execute()
+        summaries.extend(resp.get("devices", []))
+        req = svc.devices().list_next(req, resp)
+    record("devices.list", t)
 
+    device_names = [d["name"] for d in summaries]
+
+    # Step 2: parallel fan-out — per-device deviceUsers.list batched + per-device
+    # devices.get batched. Both depend on device names from step 1; neither
+    # depends on the other. Each batch goes through its own service instance.
     def _fetch_users() -> tuple[dict[str, list[dict]], float]:
         t0 = time.perf_counter()
-        out = fetch_mac_device_users(svc)
+        out = fetch_device_users_per_device(svc, device_names)
+        return out, time.perf_counter() - t0
+
+    def _fetch_full_devices() -> tuple[dict[str, dict], float]:
+        t0 = time.perf_counter()
+        get_requests = {
+            f"d{i}": svc2.devices().get(name=name)
+            for i, name in enumerate(device_names)
+        }
+        get_responses = _run_batch(svc2, get_requests)
+        out = {
+            device_names[int(rid[1:])]: resp
+            for rid, resp in get_responses.items()
+        }
         return out, time.perf_counter() - t0
 
     t = time.perf_counter()
     with ThreadPoolExecutor(max_workers=2) as pool:
         f_users = pool.submit(_fetch_users)
-        f_summaries = pool.submit(_fetch_summaries)
+        f_full = pool.submit(_fetch_full_devices)
         users_by_device, users_elapsed = f_users.result()
-        summaries, summaries_elapsed = f_summaries.result()
+        full_by_name, full_elapsed = f_full.result()
     parallel_wall = time.perf_counter() - t
     if timing is not None:
-        timing["[parallel] deviceUsers.list"] = users_elapsed
-        timing["[parallel] devices.list"] = summaries_elapsed
+        timing["[parallel] deviceUsers.list batched"] = users_elapsed
+        timing[f"[parallel] devices.get batched (n={len(device_names)})"] = full_elapsed
         timing["[parallel] section wall"] = parallel_wall
-
-    # request_ids must match googleapiclient's allowed charset, so use a short
-    # synthetic key (d0, d1, …) and key results back to the device name.
-    t = time.perf_counter()
-    get_requests = {
-        f"d{i}": svc.devices().get(name=d["name"])
-        for i, d in enumerate(summaries)
-    }
-    get_responses = _run_batch(svc, get_requests)
-    full_by_name = {
-        summaries[int(rid[1:])]["name"]: resp
-        for rid, resp in get_responses.items()
-    }
-    record(f"devices.get batched (n={len(summaries)})", t)
 
     client_ids_by_du: dict[str, list[str]] = {}
     if with_clients:
