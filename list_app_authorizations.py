@@ -14,17 +14,19 @@ DWD entry must include the admin.reports.audit.readonly scope.
 """
 from __future__ import annotations
 
+import time
+_T_MODULE_START = time.perf_counter()
+
 import argparse
-import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
 
 import google.auth
-from google.auth.transport.requests import AuthorizedSession
+from google.auth.transport.requests import AuthorizedSession, Request
 from googleapiclient.discovery import build
 
-from list_mac_devices import build_credentials
+from list_mac_devices import _format_plain, build_credentials, write_formatted
 
 SCOPES = ["https://www.googleapis.com/auth/admin.reports.audit.readonly"]
 
@@ -52,8 +54,20 @@ def _param(event: dict, name: str) -> str:
     return ""
 
 
-def fetch_token_activity(creds, days: int, user_key: str):
-    svc = build("admin", "reports_v1", credentials=creds, cache_discovery=False)
+def fetch_token_activity(
+    creds, days: int, user_key: str, *, page_log: list[float] | None = None,
+):
+    """Paginated activities.list against the `token` application.
+
+    Pass `page_log` to capture per-page wall-clock seconds; the caller can
+    derive page count + min/max/avg latency for diagnostics.
+    """
+    svc = build(
+        "admin", "reports_v1",
+        credentials=creds,
+        cache_discovery=False,
+        static_discovery=True,
+    )
     start = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
@@ -64,7 +78,10 @@ def fetch_token_activity(creds, days: int, user_key: str):
         maxResults=1000,
     )
     while req is not None:
+        t0 = time.perf_counter()
         resp = req.execute()
+        if page_log is not None:
+            page_log.append(time.perf_counter() - t0)
         for item in resp.get("items", []):
             yield item
         req = svc.activities().list_next(req, resp)
@@ -102,35 +119,50 @@ def aggregate(activities, key_by_app_name: bool = False) -> dict[tuple[str, str]
     return latest
 
 
-def render_table(rows: list[dict]) -> str:
-    def shrink(s: str, limit: int) -> str:
-        return s if len(s) <= limit else s[: limit - 1] + "…"
+HEADERS = ("USER", "APP_NAME", "EVENT", "CLIENT_TYPE", "CLIENT_ID", "LAST_EVENT")
 
-    headers = ("USER", "APP_NAME", "EVENT", "CLIENT_TYPE", "CLIENT_ID", "LAST_EVENT")
-    tabular = [
+
+def _table_columns(rows: list[dict]) -> list[tuple]:
+    """Full-data row tuples (no truncation). Used directly for CSV; trimmed
+    by `render_table` for plain output."""
+    return [
         (
             r["user"] or "-",
-            shrink(r["app_name"] or "-", 40),
+            r["app_name"] or "-",
             r["event_name"] or "-",
             r["client_type"] or "-",
-            shrink(r["client_id"] or "-", 60),
+            r["client_id"] or "-",
             r["time"] or "-",
         )
         for r in rows
     ]
-    widths = [
-        max(len(str(row[i])) for row in (tabular + [headers]))
-        for i in range(len(headers))
+
+
+def render_table(rows: list[dict]) -> str:
+    def shrink(s: str, limit: int) -> str:
+        return s if len(s) <= limit else s[: limit - 1] + "…"
+
+    # Apply terminal-width-friendly truncation to APP_NAME (col 1) and CLIENT_ID
+    # (col 4) — full values are preserved in JSON / CSV output via _table_columns.
+    full = _table_columns(rows)
+    trimmed = [
+        (r[0], shrink(r[1], 40), r[2], r[3], shrink(r[4], 60), r[5])
+        for r in full
     ]
-    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
-    lines = [fmt.format(*headers), fmt.format(*("-" * w for w in widths))]
-    lines.extend(fmt.format(*r) for r in tabular)
-    return "\n".join(lines)
+    return _format_plain(HEADERS, trimmed)
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--json", action="store_true", help="Dump raw JSON instead of a table.")
+    p.add_argument(
+        "--format", choices=["plain", "json", "csv"], default="plain",
+        help="Output format (default: plain). `json` mirrors the previous "
+             "`--json` shape; `csv` writes a header row and quote-escapes commas.",
+    )
+    p.add_argument(
+        "--output", metavar="PATH",
+        help="Write the formatted output to a file at PATH instead of stdout.",
+    )
     p.add_argument(
         "--days", type=int, default=180,
         help="Lookback window in days (default: 180; Admin Reports retention is ~6 months).",
@@ -155,6 +187,11 @@ def main() -> int:
              "recent client_id used by that user for that app. Tightens the "
              "table at the cost of distinct-OAuth-client visibility.",
     )
+    p.add_argument(
+        "--timing", action="store_true",
+        help="Print a per-phase wall-clock breakdown to stderr after the run, "
+             "including pagination page count and per-page latency stats.",
+    )
     args = p.parse_args()
 
     try:
@@ -166,11 +203,40 @@ def main() -> int:
         print("  export WORKSPACE_ADMIN_EMAIL=<admin with Reports API read privilege>", file=sys.stderr)
         return 2
 
-    self_client_id = get_sa_oauth_client_id(sa_email) if args.exclude_self else ""
+    timing: dict[str, float] = {}
+    page_log: list[float] = []
+    t_main_start = time.perf_counter()
+    if args.timing:
+        timing["module import (post 'import time')"] = t_main_start - _T_MODULE_START
 
+    self_client_id = get_sa_oauth_client_id(sa_email) if args.exclude_self else ""
+    if args.timing:
+        timing["get_sa_oauth_client_id" if args.exclude_self else "(skipped) get_sa_oauth_client_id"] = (
+            time.perf_counter() - t_main_start
+        )
+
+    t = time.perf_counter()
     creds = build_credentials(sa_email, admin_email, SCOPES)
-    activities = fetch_token_activity(creds, args.days, args.user or "all")
+    if args.timing:
+        timing["build_credentials (local)"] = time.perf_counter() - t
+
+    # Force the signJwt + token-exchange RTTs to happen NOW so they show up as
+    # their own phase, rather than folding into the first activities.list call.
+    t = time.perf_counter()
+    creds.refresh(Request())
+    if args.timing:
+        timing["auth refresh (signJwt + token)"] = time.perf_counter() - t
+
+    t = time.perf_counter()
+    activities = fetch_token_activity(
+        creds, args.days, args.user or "all",
+        page_log=page_log if args.timing else None,
+    )
     latest = aggregate(activities, key_by_app_name=args.most_recent_apps_for_user)
+    if args.timing:
+        timing[f"activities.list + aggregate (pages={len(page_log)})"] = (
+            time.perf_counter() - t
+        )
 
     rows = sorted(latest.values(), key=lambda r: r["time"], reverse=True)
     if not args.show_revoked:
@@ -178,12 +244,37 @@ def main() -> int:
     if self_client_id:
         rows = [r for r in rows if r["client_id"] != self_client_id]
 
-    if args.json:
-        json.dump(rows, sys.stdout, indent=2, sort_keys=True)
-        sys.stdout.write("\n")
-    else:
-        print(render_table(rows))
-        print(f"\n{len(rows)} app authorization(s) over the last {args.days} day(s).")
+    plain_text = render_table(rows)
+    if args.format == "plain" and not args.output:
+        plain_text = (
+            f"{plain_text}\n\n{len(rows)} app authorization(s) "
+            f"over the last {args.days} day(s)."
+        )
+    write_formatted(
+        args.format, args.output,
+        plain_text=plain_text,
+        rows_for_json=rows,
+        csv_headers=HEADERS,
+        csv_rows=_table_columns(rows),
+    )
+
+    if args.timing:
+        wall = time.perf_counter() - _T_MODULE_START
+        width = max(len(k) for k in timing)
+        print("\n--- timing (stderr) ---", file=sys.stderr)
+        for k, v in timing.items():
+            print(f"  {k:<{width}}  {v*1000:8.1f} ms", file=sys.stderr)
+        print(f"  {'-' * width}  --------", file=sys.stderr)
+        if page_log:
+            print(
+                f"  {'per-page latency':<{width}}  "
+                f"n={len(page_log)} min={min(page_log)*1000:.0f}ms "
+                f"max={max(page_log)*1000:.0f}ms "
+                f"avg={(sum(page_log)/len(page_log))*1000:.0f}ms "
+                f"total={sum(page_log)*1000:.0f}ms",
+                file=sys.stderr,
+            )
+        print(f"  {'wall (post import time)':<{width}}  {wall*1000:8.1f} ms", file=sys.stderr)
     return 0
 
 

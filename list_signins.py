@@ -20,14 +20,13 @@ report).
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
 
 from googleapiclient.discovery import build
 
-from list_mac_devices import build_credentials
+from list_mac_devices import _format_plain, build_credentials, write_formatted
 
 SCOPES = ["https://www.googleapis.com/auth/admin.reports.audit.readonly"]
 
@@ -80,17 +79,30 @@ def _param(event: dict, name: str) -> str:
     return ""
 
 
-def fetch_login_activity(creds, days: int, user_key: str):
+def fetch_login_activity(
+    creds, days: int, user_key: str, *, suspicious_only: bool = False,
+):
+    """Paginated activities.list against the `login` application.
+
+    When `suspicious_only` is True, the Admin SDK's `filters` parameter pushes
+    the is_suspicious==true predicate to the server — cuts pagination calls and
+    response volume on high-login tenants. `--failures-only` stays a
+    client-side filter because its "login_failure OR suspicious success"
+    semantics don't translate to a single server-side filter.
+    """
     svc = build("admin", "reports_v1", credentials=creds, cache_discovery=False)
     start = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-    req = svc.activities().list(
+    kwargs = dict(
         userKey=user_key,
         applicationName="login",
         startTime=start,
         maxResults=1000,
     )
+    if suspicious_only:
+        kwargs["filters"] = "is_suspicious==true"
+    req = svc.activities().list(**kwargs)
     while req is not None:
         resp = req.execute()
         for item in resp.get("items", []):
@@ -147,36 +159,48 @@ def flatten(
     return rows
 
 
-def render_table(rows: list[dict]) -> str:
-    def shrink(s: str, limit: int) -> str:
-        return s if len(s) <= limit else s[: limit - 1] + "…"
+HEADERS = ("USER", "TIME", "EVENT", "LOGIN_TYPE", "SUSPICIOUS", "IP", "LOCATION")
 
-    headers = ("USER", "TIME", "EVENT", "LOGIN_TYPE", "SUSPICIOUS", "IP", "LOCATION")
-    tabular = [
+
+def _table_columns(rows: list[dict]) -> list[tuple]:
+    """Full-data row tuples (no truncation). Used directly for CSV; trimmed
+    by `render_table` for plain output."""
+    return [
         (
             r["user"] or "-",
             r["time"] or "-",
             r["event"] or "-",
             r["login_type"] or "-",
             "true" if r["suspicious"] else "-",
-            shrink(r["ip"] or "-", 39),
+            r["ip"] or "-",
             r["location"] or "-",
         )
         for r in rows
     ]
-    widths = [
-        max(len(str(row[i])) for row in (tabular + [headers]))
-        for i in range(len(headers))
-    ]
-    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
-    lines = [fmt.format(*headers), fmt.format(*("-" * w for w in widths))]
-    lines.extend(fmt.format(*r) for r in tabular)
-    return "\n".join(lines)
+
+
+def render_table(rows: list[dict]) -> str:
+    def shrink(s: str, limit: int) -> str:
+        return s if len(s) <= limit else s[: limit - 1] + "…"
+
+    # Trim IPv6 (col 5) at IPv6 max width for the plain table; full value
+    # preserved in JSON / CSV output.
+    full = _table_columns(rows)
+    trimmed = [(r[0], r[1], r[2], r[3], r[4], shrink(r[5], 39), r[6]) for r in full]
+    return _format_plain(HEADERS, trimmed)
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--json", action="store_true", help="Dump raw JSON instead of a table.")
+    p.add_argument(
+        "--format", choices=["plain", "json", "csv"], default="plain",
+        help="Output format (default: plain). `json` mirrors the previous "
+             "`--json` shape; `csv` writes a header row and quote-escapes commas.",
+    )
+    p.add_argument(
+        "--output", metavar="PATH",
+        help="Write the formatted output to a file at PATH instead of stdout.",
+    )
     p.add_argument(
         "--days", type=int, default=30,
         help="Lookback window in days (default: 30).",
@@ -191,7 +215,9 @@ def main() -> int:
     )
     p.add_argument(
         "--suspicious-only", action="store_true",
-        help="Show only events flagged is_suspicious=true (any event type).",
+        help="Show only events flagged is_suspicious=true (any event type). "
+             "Applied server-side via the Reports API `filters` parameter, "
+             "so this also reduces API call count and response volume.",
     )
     p.add_argument(
         "--include-logout", action="store_true",
@@ -213,23 +239,31 @@ def main() -> int:
         return 2
 
     creds = build_credentials(sa_email, admin_email, SCOPES)
-    activities = fetch_login_activity(creds, args.days, args.user or "all")
+    activities = fetch_login_activity(
+        creds, args.days, args.user or "all",
+        suspicious_only=args.suspicious_only,
+    )
     rows = flatten(
         activities,
         include_logout=args.include_logout,
         include_challenges=args.include_challenges,
         failures_only=args.failures_only,
     )
-    if args.suspicious_only:
-        rows = [r for r in rows if r["suspicious"]]
     rows.sort(key=lambda r: r["time"], reverse=True)
 
-    if args.json:
-        json.dump(rows, sys.stdout, indent=2, sort_keys=True, default=str)
-        sys.stdout.write("\n")
-    else:
-        print(render_table(rows))
-        print(f"\n{len(rows)} sign-in event(s) over the last {args.days} day(s).")
+    plain_text = render_table(rows)
+    if args.format == "plain" and not args.output:
+        plain_text = (
+            f"{plain_text}\n\n{len(rows)} sign-in event(s) "
+            f"over the last {args.days} day(s)."
+        )
+    write_formatted(
+        args.format, args.output,
+        plain_text=plain_text,
+        rows_for_json=rows,
+        csv_headers=HEADERS,
+        csv_rows=_table_columns(rows),
+    )
     return 0
 
 

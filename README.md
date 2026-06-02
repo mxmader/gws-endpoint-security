@@ -123,10 +123,8 @@ uv run python prune_devices.py                      # DRY RUN of prune candidate
 uv run python prune_devices.py --execute            # actually delete
 ```
 
-`list_mac_devices.py`, `list_users_with_macs.py`, and `prune_devices.py`
-accept `--format {plain,json,csv}` and `--output PATH` for non-interactive
-consumption. The Reports scripts still accept `--json` (out of scope of the
-recent rework). See `--help` on each for the full flag set.
+All five scripts accept `--format {plain,json,csv}` and `--output PATH`
+for non-interactive consumption. See `--help` on each for the full flag set.
 
 ## How auth works (no key file)
 
