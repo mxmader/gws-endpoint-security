@@ -199,6 +199,57 @@ def _run_batch(
     return results
 
 
+def fetch_user_device_users(
+    svc, user_email: str,
+) -> tuple[dict[str, list[dict]], bool]:
+    """Return ({device_id: [DeviceUser, ...]}, server_side_filtered) for one user.
+
+    Mirrors `fetch_mac_device_users()` but restricted to a single user. Tries
+    an AIP-160 `email:` filter server-side first; on HTTP 400 (filter syntax
+    rejected) falls back to the bulk listing with client-side filter. Either
+    way the result is the deviceId → DeviceUser map the rest of the pipeline
+    expects.
+    """
+    target = user_email.lower()
+    by_device: dict[str, list[dict]] = {}
+
+    try:
+        req = svc.devices().deviceUsers().list(
+            parent="devices/-",
+            customer="customers/my_customer",
+            filter=f"type:mac AND email:{user_email}",
+            fields="deviceUsers(name,userEmail),nextPageToken",
+        )
+        while req is not None:
+            resp = _execute(req)
+            for du in resp.get("deviceUsers") or []:
+                # Defensive: if the server filter widens, still require an
+                # exact (case-insensitive) email match client-side.
+                if (du.get("userEmail") or "").lower() != target:
+                    continue
+                device_id = _device_id(du.get("name", ""))
+                if not device_id:
+                    continue
+                by_device.setdefault(device_id, []).append({
+                    "name": du.get("name", ""),
+                    "userEmail": du.get("userEmail", ""),
+                })
+            req = svc.devices().deviceUsers().list_next(req, resp)
+        return by_device, True
+    except HttpError as exc:
+        if _http_status(exc) != 400:
+            raise
+        # Filter rejected — fall through.
+
+    # Fallback: bulk listing + client-side filter.
+    bulk = fetch_mac_device_users(svc)
+    for dev_id, dus in bulk.items():
+        filtered = [u for u in dus if (u.get("userEmail") or "").lower() == target]
+        if filtered:
+            by_device[dev_id] = filtered
+    return by_device, False
+
+
 def fetch_mac_device_users(svc) -> dict[str, list[dict]]:
     """deviceId -> [{'name', 'userEmail'}, ...] for every Mac DeviceUser, bulk paginated.
 
@@ -261,6 +312,7 @@ def list_mac_devices(
     with_clients: bool,
     last_sync_days: int,
     include_browser: bool,
+    user_email: str | None = None,
     timing: dict | None = None,
 ):
     def record(label: str, t_start: float) -> None:
@@ -285,30 +337,63 @@ def list_mac_devices(
     )
     record("discovery build (x2)", t)
 
-    # Step 1: devices.list with expanded projection — we need lastSyncTime
-    # and serialNumber for client-side filter + dedup, and the rest for the
-    # output table. The Cloud Identity API does NOT support filtering on
-    # lastSyncTime or "serial-non-empty" server-side, so this is the smallest
-    # set the API will give us pre-prune.
-    t = time.perf_counter()
-    list_fields = (
-        "devices(name,serialNumber,lastSyncTime,model,osVersion,assetTag,"
-        "encryptionState,hostname,deviceType),nextPageToken"
-    )
-    summaries: list[dict] = []
-    req = svc.devices().list(
-        customer="customers/my_customer",
-        filter="type:mac",
-        view=view,
-        fields=list_fields,
-    )
-    while req is not None:
-        resp = _execute(req)
-        summaries.extend(resp.get("devices", []))
-        req = svc.devices().list_next(req, resp)
-    record(f"devices.list (raw_n={len(summaries)})", t)
+    # Two acquisition paths, both producing the same downstream shape:
+    #   summaries        — list of device dicts with the filter+display fields
+    #   users_by_device  — deviceId → [DeviceUser, ...] for user attribution
+    #   full_by_name     — device name → full record (for EV browser attribute)
+    if user_email:
+        # Focused path: --user is set. Skip devices.list entirely. Fetch only
+        # this user's DeviceUsers (server-side email filter where the API
+        # supports it), then devices.get on those device IDs — which returns
+        # full records including all the fields devices.list would have given
+        # us. Massive overhead reduction on noisy tenants.
+        t = time.perf_counter()
+        users_by_device, server_filtered = fetch_user_device_users(svc, user_email)
+        record(
+            f"deviceUsers.list for user ({'server' if server_filtered else 'client'}-filter)",
+            t,
+        )
+        device_names = [f"devices/{dev_id}" for dev_id in users_by_device]
+        if device_names:
+            t = time.perf_counter()
+            get_factories: dict[str, Callable[[], object]] = {
+                f"d{i}": (lambda nm=name: svc.devices().get(name=nm))
+                for i, name in enumerate(device_names)
+            }
+            get_responses = _run_batch(svc, get_factories)
+            full_by_name = {
+                device_names[int(rid[1:])]: resp for rid, resp in get_responses.items()
+            }
+            summaries = list(full_by_name.values())
+            record(f"devices.get batched (n={len(device_names)})", t)
+        else:
+            full_by_name = {}
+            summaries = []
+    else:
+        # Tenant-wide path: devices.list with expanded projection, then
+        # parallel bulk deviceUsers.list + batched devices.get (only when
+        # --include-browser, since devices.list already supplies basic fields).
+        t = time.perf_counter()
+        list_fields = (
+            "devices(name,serialNumber,lastSyncTime,model,osVersion,assetTag,"
+            "encryptionState,hostname,deviceType),nextPageToken"
+        )
+        summaries = []
+        req = svc.devices().list(
+            customer="customers/my_customer",
+            filter="type:mac",
+            view=view,
+            fields=list_fields,
+        )
+        while req is not None:
+            resp = _execute(req)
+            summaries.extend(resp.get("devices", []))
+            req = svc.devices().list_next(req, resp)
+        record(f"devices.list (raw_n={len(summaries)})", t)
+        full_by_name = {}
+        users_by_device = {}
 
-    # Step 2: client-side filter (active + serialed) + dedup by serial,
+    # Shared: client-side filter (active + serialed) + dedup by serial,
     # keeping the most recent record per serial (by lastSyncTime).
     t = time.perf_counter()
     cutoff = datetime.now(timezone.utc) - timedelta(days=last_sync_days)
@@ -332,42 +417,40 @@ def list_mac_devices(
 
     survivor_names = [d["name"] for d in survivors_by_serial.values()]
 
-    # Step 3: parallel fan-out for the surviving set.
-    # - bulk deviceUsers.list (one paginated call across the tenant; the
-    #   single quota unit per page is cheaper than per-survivor calls).
-    # - batched devices.get on survivors only — enriches with the EV browser
-    #   attribute. Only runs when the caller opts in via --include-browser.
-    def _fetch_users_bulk() -> tuple[dict[str, list[dict]], float]:
-        t0 = time.perf_counter()
-        out = fetch_mac_device_users(svc)
-        return out, time.perf_counter() - t0
+    # Tenant-wide path only: parallel bulk deviceUsers.list + batched
+    # devices.get on survivors. In the focused path we already have both.
+    if not user_email:
+        def _fetch_users_bulk() -> tuple[dict[str, list[dict]], float]:
+            t0 = time.perf_counter()
+            out = fetch_mac_device_users(svc)
+            return out, time.perf_counter() - t0
 
-    def _fetch_full_survivors() -> tuple[dict[str, dict], float]:
-        t0 = time.perf_counter()
-        if not include_browser or not survivor_names:
-            return {}, time.perf_counter() - t0
-        get_factories: dict[str, Callable[[], object]] = {
-            f"d{i}": (lambda nm=name: svc2.devices().get(name=nm))
-            for i, name in enumerate(survivor_names)
-        }
-        get_responses = _run_batch(svc2, get_factories)
-        return (
-            {survivor_names[int(rid[1:])]: resp for rid, resp in get_responses.items()},
-            time.perf_counter() - t0,
-        )
+        def _fetch_full_survivors() -> tuple[dict[str, dict], float]:
+            t0 = time.perf_counter()
+            if not include_browser or not survivor_names:
+                return {}, time.perf_counter() - t0
+            get_factories = {
+                f"d{i}": (lambda nm=name: svc2.devices().get(name=nm))
+                for i, name in enumerate(survivor_names)
+            }
+            get_responses = _run_batch(svc2, get_factories)
+            return (
+                {survivor_names[int(rid[1:])]: resp for rid, resp in get_responses.items()},
+                time.perf_counter() - t0,
+            )
 
-    t = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f_users = pool.submit(_fetch_users_bulk)
-        f_full = pool.submit(_fetch_full_survivors)
-        users_by_device, users_elapsed = f_users.result()
-        full_by_name, full_elapsed = f_full.result()
-    parallel_wall = time.perf_counter() - t
-    if timing is not None:
-        timing["[parallel] deviceUsers.list bulk"] = users_elapsed
-        full_label = f"n={len(survivor_names)}" if include_browser else "skipped"
-        timing[f"[parallel] devices.get batched ({full_label})"] = full_elapsed
-        timing["[parallel] section wall"] = parallel_wall
+        t = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_users = pool.submit(_fetch_users_bulk)
+            f_full = pool.submit(_fetch_full_survivors)
+            users_by_device, users_elapsed = f_users.result()
+            full_by_name, full_elapsed = f_full.result()
+        parallel_wall = time.perf_counter() - t
+        if timing is not None:
+            timing["[parallel] deviceUsers.list bulk"] = users_elapsed
+            full_label = f"n={len(survivor_names)}" if include_browser else "skipped"
+            timing[f"[parallel] devices.get batched ({full_label})"] = full_elapsed
+            timing["[parallel] section wall"] = parallel_wall
 
     # clientStates fan-out — survivors only, batched, with retry.
     client_ids_by_du: dict[str, list[str]] = {}
@@ -432,19 +515,20 @@ def classify_signals(d: dict) -> str:
     # The Cloud Identity API doesn't expose a "reporting agent" field. Signals
     # arrive from whichever first-party Google client is signed in with a
     # managed identity — a Chrome session with any first-party extension
-    # (Docs Offline, Endpoint Verification, Drive web, ...) supplies browser-
+    # (Docs Offline, Endpoint Verification, Drive web, ...) supplies Chrome-
     # level signals, while native apps (Drive for Desktop, EV's native helper
-    # .pkg, ...) supply hardware identifiers. We can't tell which from the
-    # response, so we describe the *signal mix* present, not the source.
+    # .pkg, ...) supply hardware identifiers. We label by Chrome rather than
+    # "browser" because only Chrome carries the first-party extension surface
+    # that pushes these signals — Firefox/Safari/Edge never appear here.
     has_sn = bool(d.get("serialNumber"))
     has_enc = bool(d.get("encryptionState"))
     has_host = bool(d.get("hostname"))
     if has_sn and has_enc:
-        return "browser + hardware"
+        return "chrome + hardware"
     if has_sn and has_host and not has_enc:
         return "hardware only"
     if has_enc and not has_sn:
-        return "browser only"
+        return "chrome only"
     if d.get("model") == "Mac OS":
         return "stale / minimal"
     return "unknown"
@@ -488,6 +572,7 @@ def _table_columns(devices: list[dict], with_clients: bool, include_browser: boo
             classify_signals(d),
             d.get("serialNumber", "-"),
             d.get("model", "-"),
+            d.get("hostname") or "-",
             d.get("assetTag", "-"),
             d.get("encryptionState", "-"),
             d.get("lastSyncTime", "-"),
@@ -499,7 +584,7 @@ def _table_columns(devices: list[dict], with_clients: bool, include_browser: boo
     headers: tuple = ("USER",)
     if include_browser:
         headers = headers + ("BROWSER",)
-    headers = headers + ("SIGNALS", "SERIAL", "MODEL", "ASSET_TAG", "ENCRYPTION", "LAST_SYNC")
+    headers = headers + ("SIGNALS", "SERIAL", "MODEL", "HOSTNAME", "ASSET_TAG", "ENCRYPTION", "LAST_SYNC")
     if with_clients:
         headers = headers + ("CLIENTS",)
     rows = [row(d) for d in devices]
@@ -583,6 +668,15 @@ def main() -> int:
              "audits, but expect more quota pressure.",
     )
     p.add_argument(
+        "--user", metavar="EMAIL",
+        help="Restrict to devices associated with a single user (by email). "
+             "Skips the tenant-wide devices.list call and the bulk "
+             "deviceUsers.list call — issues only one targeted "
+             "deviceUsers.list (server-side email filter where supported) and "
+             "one batched devices.get for the user's device set. The fastest "
+             "and cheapest way to look up one user's Macs.",
+    )
+    p.add_argument(
         "--include-browser", action="store_true",
         help="Add the BROWSER column (Chrome version per device from the EV "
              "signal block). Costs one extra devices.get call per survivor — "
@@ -640,6 +734,7 @@ def main() -> int:
         with_clients=args.clients,
         last_sync_days=args.last_sync_days,
         include_browser=args.include_browser,
+        user_email=args.user,
         timing=timing,
     ))
     # Surface unencrypted Macs at the top; encrypted ones at the bottom.

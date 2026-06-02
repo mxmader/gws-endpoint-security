@@ -39,7 +39,7 @@ Universal settings → Endpoint verification → "Collect device signals…"** m
 be ON for the user's OU. Without it, the browser signals never leave the
 client.
 
-### Endpoint Verification extension + native helper (browser + hardware)
+### Endpoint Verification extension + native helper (chrome + hardware)
 
 EV's native helper is an optional `.pkg` you install on the Mac alongside the
 Chrome extension. The extension alone behaves like any other first-party
@@ -172,8 +172,8 @@ Two companion scripts handle the inverse / user-centric views:
 
 | Label | Has `encryptionState` | Has `serialNumber` | Has `hostname` | Likely agent(s) |
 |---|---|---|---|---|
-| `browser + hardware` | ✓ | ✓ | varies | EV extension + native helper |
-| `browser only` | ✓ | — | — | Signed-in managed Chrome (any first-party ext.) |
+| `chrome + hardware` | ✓ | ✓ | varies | EV extension + native helper |
+| `chrome only` | ✓ | — | — | Signed-in managed Chrome (any first-party ext.) |
 | `hardware only` | — | ✓ | ✓ | Drive for desktop (or similar native client) |
 | `stale / minimal` | — | — | — | Old / minimal registration (`model == "Mac OS"`) |
 | `unknown` | other combination | other combination | other combination | — |
@@ -186,7 +186,7 @@ Sort puts non-`ENCRYPTED` rows first; encrypted rows follow.
 USER                              SIGNALS             SERIAL         MODEL        ASSET_TAG  ENCRYPTION  LAST_SYNC
 --------------------------------  ------------------  -------------  -----------  ---------  ----------  ------------------------
 bob@example.com, eve@example.com  hardware only       C02ZZZZZZZZZ2  Mac16,6      -          -           2026-05-29T16:02:30.005Z
-alice@example.com                 browser + hardware  C02ZZZZZZZZZ1  MacBook Pro  -          ENCRYPTED   2026-05-29T18:19:07.448Z
+alice@example.com                 chrome + hardware   C02ZZZZZZZZZ1  MacBook Pro  -          ENCRYPTED   2026-05-29T18:19:07.448Z
 ```
 
 Add `--include-browser` to pull each device's Chrome version (from the EV
@@ -204,11 +204,11 @@ Reading this:
 - **alice's** Mac has the EV extension *and* native helper, so a single
   record carries both `serialNumber` and `encryptionState` and we know
   FileVault is on.
-- Records that fail the default filter — no serial (browser-only Chrome
-  sessions like alice's older MacBookPro17,1, or carol/dave's machines
-  that only have managed Chrome), or sync older than 30 days, or the
-  classic `stale / minimal` model="Mac OS" placeholders — are dropped
-  from this view. `prune_devices.py` is the script that physically
+- Records that fail the default filter — no serial (Chrome-only sessions
+  like alice's older MacBookPro17,1, or carol/dave's machines that only
+  have managed Chrome), or sync older than 30 days, or the classic
+  `stale / minimal` model="Mac OS" placeholders — are dropped from this
+  view. `prune_devices.py` is the script that physically
   deletes them; `list_users_with_macs.py --only-no-mac` is the place to
   see the users they left behind.
 

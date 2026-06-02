@@ -8,6 +8,23 @@ Desktop", "Slack", etc.). For each (user, client_id) pair we surface the most
 recent event in the lookback window; revoked apps are dropped unless
 --show-revoked is set.
 
+OAUTH_CLIENT_TYPE is the registered OAuth client type of the client_id, set
+by the developer when they created the OAuth client in Google Cloud Console.
+It describes the client *registration*, **not** the medium the user
+consented through:
+
+- `WEB` — Web application (server-side redirect-URI flow). Covers pure web
+  apps AND native apps whose authors registered a Web Application client
+  and use a localhost redirect for the consent step.
+- `IOS` — Native iOS app.
+- `ANDROID` — Native Android app.
+- `DESKTOP` / `NATIVE` — Native desktop installed app (loopback / PKCE flow).
+
+So a `WEB` value can be either a true web app or a native app whose authors
+registered a Web Application client. APP_NAME is usually the better signal
+for the actual form factor — Google curates names like
+"Google Drive for Desktop", "Slack (Desktop)", etc.
+
 Auth: keyless. Uses your local gcloud ADC + the IAM signJwt API to mint a
 domain-wide-delegated access token impersonating WORKSPACE_ADMIN_EMAIL. The
 DWD entry must include the admin.reports.audit.readonly scope.
@@ -119,7 +136,7 @@ def aggregate(activities, key_by_app_name: bool = False) -> dict[tuple[str, str]
     return latest
 
 
-HEADERS = ("USER", "APP_NAME", "EVENT", "CLIENT_TYPE", "CLIENT_ID", "LAST_EVENT")
+HEADERS = ("USER", "APP_NAME", "EVENT", "OAUTH_CLIENT_TYPE", "CLIENT_ID", "LAST_EVENT")
 
 
 def _table_columns(rows: list[dict]) -> list[tuple]:
@@ -153,7 +170,10 @@ def render_table(rows: list[dict]) -> str:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p.add_argument(
         "--format", choices=["plain", "json", "csv"], default="plain",
         help="Output format (default: plain). `json` mirrors the previous "

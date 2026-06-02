@@ -135,7 +135,11 @@ def _user_sort_key(row: dict) -> tuple:
 
 
 def _format_macs_cell(macs: list[dict]) -> str:
-    """`ENCRYPTED C02ZZ1 (MacBook Pro), NOT_ENCRYPTED C02ZZ2 (Mac16,6)` or `-`."""
+    """`ENCRYPTED C02ZZ1 (MacBook Pro, my-mbp.local), NOT_ENCRYPTED C02ZZ2 (Mac16,6)` or `-`.
+
+    Hostname (when known) joins model inside the parens; if hostname is
+    missing, only the model appears.
+    """
     if not macs:
         return "-"
     parts: list[str] = []
@@ -143,7 +147,9 @@ def _format_macs_cell(macs: list[dict]) -> str:
         enc = (m.get("encryptionState") or "UNKNOWN").upper()
         serial = m.get("serialNumber") or "?"
         model = m.get("model") or "?"
-        parts.append(f"{enc} {serial} ({model})")
+        hostname = (m.get("hostname") or "").strip()
+        suffix = f"({model}, {hostname})" if hostname else f"({model})"
+        parts.append(f"{enc} {serial} {suffix}")
     return ", ".join(parts)
 
 
