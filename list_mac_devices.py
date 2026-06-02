@@ -43,6 +43,31 @@ SCOPES = ["https://www.googleapis.com/auth/cloud-identity.devices.readonly"]
 # Per-batch size for BatchHttpRequest. Google recommends <=50; hard cap is 1000.
 _BATCH_SIZE = 50
 
+# Decoder ring for Apple model identifiers (e.g. "Mac16,6" → "MacBook Pro 14\" M4 Max
+# (2024)"). Maintained by hand at the repo root; expand as new models appear in
+# the field. Falls back gracefully to the raw identifier when a model is absent
+# from the file or the file itself is missing/malformed. To be retired when we
+# can call the Apple Business Manager API.
+_MAC_MODELS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mac_models.json")
+
+
+def _load_mac_models() -> dict[str, str]:
+    try:
+        with open(_MAC_MODELS_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+_MAC_MODELS = _load_mac_models()
+
+
+def decode_model(raw: str | None) -> str:
+    """Map an Apple model identifier to a human-readable name, or '' if unknown."""
+    if not raw:
+        return ""
+    return _MAC_MODELS.get(raw, "")
+
 # Bounded retry for transient errors (429 RATE_LIMIT_EXCEEDED, 5xx).
 _MAX_RETRIES = 4
 _BACKOFF_BASE_SEC = 2.0
@@ -507,6 +532,11 @@ def list_mac_devices(
                     emails[ue] = None
         d["userEmails"] = list(emails)
 
+        # Enrich with a human-readable model name when we recognize the
+        # identifier. JSON output keeps both `model` (raw) and `modelName`
+        # (narrative, or "" when unknown).
+        d["modelName"] = decode_model(d.get("model"))
+
         d["browser"] = extract_browser(full) if include_browser else ""
 
         if with_clients:
@@ -581,7 +611,10 @@ def _table_columns(devices: list[dict], with_clients: bool, include_browser: boo
         base = base + (
             classify_signals(d),
             d.get("serialNumber", "-"),
-            d.get("model", "-"),
+            # Prefer the decoded narrative when we have it; fall back to the
+            # raw Apple model identifier otherwise.
+            d.get("modelName") or d.get("model") or "-",
+            d.get("osVersion") or "-",
             d.get("hostname") or "-",
             d.get("assetTag", "-"),
             d.get("encryptionState", "-"),
@@ -594,7 +627,7 @@ def _table_columns(devices: list[dict], with_clients: bool, include_browser: boo
     headers: tuple = ("USER",)
     if include_browser:
         headers = headers + ("BROWSER",)
-    headers = headers + ("SIGNALS", "SERIAL", "MODEL", "HOSTNAME", "ASSET_TAG", "ENCRYPTION", "LAST_SYNC")
+    headers = headers + ("SIGNALS", "SERIAL", "MODEL", "OS_VERSION", "HOSTNAME", "ASSET_TAG", "ENCRYPTION", "LAST_SYNC")
     if with_clients:
         headers = headers + ("CLIENTS",)
     rows = [row(d) for d in devices]
