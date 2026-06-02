@@ -7,8 +7,11 @@ the trailing --last-sync-days, has a serial, deduped by serial). Sort
 surfaces gaps first:
 
   1. Users with no Mac associated.
-  2. Users with at least one Mac NOT in `ENCRYPTED` state.
-  3. Users with all associated Macs `ENCRYPTED`.
+  2. Users with at least one Mac whose encryption status couldn't be
+     determined (missing / UNSPECIFIED / UNSUPPORTED_BY_DEVICE).
+  3. Users with at least one Mac in `NOT_ENCRYPTED` state (and no
+     undetermined Macs).
+  4. Users with all associated Macs `ENCRYPTED`.
 
 Within each group, sort by primary email.
 
@@ -107,14 +110,27 @@ def correlate(users: list[dict], macs: list[dict]) -> list[dict]:
 
 
 def _user_sort_key(row: dict) -> tuple:
-    """Group users: no mac (0) -> any non-ENCRYPTED (1) -> all ENCRYPTED (2)."""
+    """Group users by escalating "what to look at first" priority.
+
+    0: no Mac at all (can't even start auditing).
+    1: at least one Mac whose encryption status couldn't be determined —
+       missing, UNSPECIFIED, UNSUPPORTED_BY_DEVICE. Top priority because
+       posture is unknown.
+    2: at least one Mac explicitly NOT_ENCRYPTED, no undetermined Macs.
+    3: all associated Macs ENCRYPTED.
+    Within each group, sort by primaryEmail.
+    """
     macs = row.get("_macs") or []
     if not macs:
         group = 0
-    elif any((m.get("encryptionState") or "").upper() != "ENCRYPTED" for m in macs):
-        group = 1
     else:
-        group = 2
+        statuses = [(m.get("encryptionState") or "").upper() for m in macs]
+        if any(s not in ("ENCRYPTED", "NOT_ENCRYPTED") for s in statuses):
+            group = 1
+        elif any(s == "NOT_ENCRYPTED" for s in statuses):
+            group = 2
+        else:
+            group = 3
     return (group, (row.get("primaryEmail") or "").lower())
 
 
@@ -237,21 +253,29 @@ def main() -> int:
         rows = [r for r in rows if not r.get("_macs")]
     rows.sort(key=_user_sort_key)
 
-    no_mac_n = sum(1 for r in rows if not r.get("_macs"))
-    unenc_n = sum(
-        1 for r in rows
-        if r.get("_macs")
-        and any((m.get("encryptionState") or "").upper() != "ENCRYPTED"
-                for m in r["_macs"])
-    )
+    # Bucket counts mirror the sort groups (0..3) so the footer reads in the
+    # same order as the rendered table.
+    no_mac_n = undetermined_n = not_enc_n = all_enc_n = 0
+    for r in rows:
+        g = _user_sort_key(r)[0]
+        if g == 0:
+            no_mac_n += 1
+        elif g == 1:
+            undetermined_n += 1
+        elif g == 2:
+            not_enc_n += 1
+        else:
+            all_enc_n += 1
 
     headers, table_rows = _table_columns(rows)
     plain_text = _format_plain(headers, table_rows)
     if args.format == "plain" and not args.output:
         plain_text = (
             f"{plain_text}\n\n{len(rows)} user(s): "
-            f"{no_mac_n} with no Mac, {unenc_n} with at least one unencrypted Mac, "
-            f"{len(rows) - no_mac_n - unenc_n} fully encrypted."
+            f"{no_mac_n} with no Mac, "
+            f"{undetermined_n} with a Mac whose encryption is undetermined, "
+            f"{not_enc_n} with a Mac in NOT_ENCRYPTED state, "
+            f"{all_enc_n} fully encrypted."
         )
 
     write_formatted(

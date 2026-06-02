@@ -2,8 +2,9 @@
 """List active Mac devices in the Workspace tenant with their encryption status.
 
 By default surfaces only devices that (a) report a serial number and (b) have
-synced in the last 30 days, deduped by serial. Rows are sorted so
-non-ENCRYPTED Macs appear first — at-risk records are eye-scannable. The
+synced in the last 30 days, deduped by serial. Rows are sorted so Macs
+with undetermined encryption surface first, then NOT_ENCRYPTED, then
+ENCRYPTED — at-risk records are eye-scannable. The
 Cloud Identity Devices API holds many records per physical Mac (per user /
 app / OS version / login vector); without filtering, a noisy tenant easily
 exceeds the `devices_read_requests` quota (1500/min). Use `--last-sync-days
@@ -450,14 +451,23 @@ def classify_signals(d: dict) -> str:
 
 
 def encryption_sort_key(d: dict) -> tuple:
-    """Sort survivor Macs so unencrypted records surface first.
+    """Sort survivor Macs so the riskiest records surface first.
 
-    Group 0: encryptionState != "ENCRYPTED" (gaps to fix).
-    Group 1: encryptionState == "ENCRYPTED" (clean).
+    Group 0: encryption status undetermined — missing, ENCRYPTION_STATE_
+             UNSPECIFIED, UNSUPPORTED_BY_DEVICE, or any unrecognized value.
+             Top priority for follow-up: we can't even confirm FileVault is
+             on, so the device's posture is unknown.
+    Group 1: NOT_ENCRYPTED — known gap.
+    Group 2: ENCRYPTED — clean.
     Within each group: by primary userEmail then serialNumber.
     """
     enc = (d.get("encryptionState") or "").upper()
-    group = 1 if enc == "ENCRYPTED" else 0
+    if enc == "ENCRYPTED":
+        group = 2
+    elif enc == "NOT_ENCRYPTED":
+        group = 1
+    else:
+        group = 0
     emails = d.get("userEmails") or []
     primary_email = emails[0] if emails else ""
     serial = d.get("serialNumber") or ""
