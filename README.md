@@ -3,9 +3,12 @@
 Reports for a Google Workspace tenant, run against a keyless service account
 with domain-wide delegation:
 
-- [`list_mac_devices.py`](./list_mac_devices.py) — every Mac with its
-  encryption status (FileVault), reporting browser, signal mix, etc., from
-  the Cloud Identity Devices API.
+- [`list_mac_devices.py`](./list_mac_devices.py) — active Macs (synced in
+  the trailing 30 days, with a serial number, deduped by serial) with their
+  encryption status (FileVault), signal mix, etc., from the Cloud Identity
+  Devices API. Tune the window via `--last-sync-days N`; add the BROWSER
+  column (Chrome version, one extra `devices.get` per device) via
+  `--include-browser`.
 - [`list_app_authorizations.py`](./list_app_authorizations.py) — every
   OAuth-authorized app per user (Drive desktop, Slack, Outlook, …) from the
   Admin SDK Reports `token` activity log.
@@ -96,8 +99,9 @@ uv run python list_signins.py --days 7              # sign-in events with IP + m
 ```
 
 All three scripts accept `--json` for raw output. See `--help` on each for
-other flags (`--clients`, `--view`, `--user`, `--show-revoked`,
-`--failures-only`, `--suspicious-only`, …).
+other flags (`--last-sync-days`, `--include-browser`, `--clients`,
+`--view`, `--user`, `--show-revoked`, `--failures-only`,
+`--suspicious-only`, …).
 
 ## How auth works (no key file)
 

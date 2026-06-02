@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""List all MAC_OS devices in the Workspace tenant with their encryption status.
+"""List active Mac devices in the Workspace tenant with their encryption status.
+
+By default surfaces only devices that (a) report a serial number and (b) have
+synced in the last 30 days, deduped by serial. The Cloud Identity Devices API
+holds many records per physical Mac (per user / app / OS version / login
+vector); without filtering, a noisy tenant easily exceeds the
+`devices_read_requests` quota (1500/min). Use `--last-sync-days N` to widen
+the window; use `--include-browser` to pull each survivor's Chrome version
+from the EV signal block — at the cost of one extra `devices.get` call per
+surviving device.
 
 Auth: keyless. Uses your local gcloud ADC + the IAM signJwt API to mint a
 domain-wide-delegated access token impersonating WORKSPACE_ADMIN_EMAIL.
@@ -12,19 +21,27 @@ _T_MODULE_START = time.perf_counter()
 import argparse
 import json
 import os
+import random
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 import google.auth
 from google.auth import iam
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 SCOPES = ["https://www.googleapis.com/auth/cloud-identity.devices.readonly"]
 
 # Per-batch size for BatchHttpRequest. Google recommends <=50; hard cap is 1000.
 _BATCH_SIZE = 50
+
+# Bounded retry for transient errors (429 RATE_LIMIT_EXCEEDED, 5xx).
+_MAX_RETRIES = 4
+_BACKOFF_BASE_SEC = 2.0
 
 
 def build_credentials(
@@ -49,69 +66,154 @@ def _device_id(resource_name: str) -> str:
     return parts[1] if len(parts) >= 2 and parts[0] == "devices" else ""
 
 
-def fetch_device_users_per_device(
-    svc, device_names: list[str]
-) -> dict[str, list[dict]]:
-    """deviceId -> [{'name', 'userEmail'}, ...] via per-device deviceUsers.list, batched.
-
-    Replaces the bulk `parent="devices/-"` paginated call. For tenants with
-    accumulated session history the bulk call's server-side cost (filtering
-    and paginating thousands of records) dominates; per-device calls operate
-    on a smaller working set each, and 50 fit in a single batch envelope.
-
-    Does not handle nextPageToken — in practice a single device's session
-    history fits comfortably in the default page. If we ever see this in the
-    wild we'll fall back to a paginated tail for those devices.
-    """
-    if not device_names:
-        return {}
-    requests = {
-        f"u{i}": svc.devices().deviceUsers().list(
-            parent=name,
-            customer="customers/my_customer",
-            fields="deviceUsers(name,userEmail),nextPageToken",
-        )
-        for i, name in enumerate(device_names)
-    }
-    responses = _run_batch(svc, requests)
-    by_device: dict[str, list[dict]] = {}
-    for rid, resp in responses.items():
-        device_name = device_names[int(rid[1:])]
-        device_id = _device_id(device_name)
-        by_device[device_id] = [
-            {"name": du.get("name", ""), "userEmail": du.get("userEmail", "")}
-            for du in (resp.get("deviceUsers") or [])
-        ]
-    return by_device
+def _http_status(exc: BaseException) -> int | None:
+    if isinstance(exc, HttpError) and getattr(exc, "resp", None) is not None:
+        try:
+            return int(exc.resp.status)
+        except (AttributeError, ValueError, TypeError):
+            return None
+    return None
 
 
-def _run_batch(svc, requests_by_id: dict[str, object]) -> dict[str, dict]:
-    """Execute a {request_id: HttpRequest} map via BatchHttpRequest in chunks.
+def _is_retryable(exc: BaseException) -> bool:
+    status = _http_status(exc)
+    return status == 429 or (status is not None and 500 <= status < 600)
 
-    Returns {request_id: response_dict}. Raises on the first sub-request
-    error — matches the prior ThreadPoolExecutor behavior where any raise
-    in a worker propagated through `pool.map`.
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """Parse a Retry-After response header from an HttpError, if present."""
+    if not isinstance(exc, HttpError) or getattr(exc, "resp", None) is None:
+        return None
+    try:
+        ra = exc.resp.get("retry-after")
+    except AttributeError:
+        return None
+    if not ra:
+        return None
+    try:
+        return float(ra)
+    except (TypeError, ValueError):
+        return None
+
+
+def _backoff_seconds(attempt: int, exc: BaseException | None = None) -> float:
+    if exc is not None:
+        ra = _retry_after_seconds(exc)
+        if ra is not None:
+            return ra
+    delay = _BACKOFF_BASE_SEC * (2 ** attempt)
+    return delay * (1 + random.uniform(-0.25, 0.25))
+
+
+def _execute(req):
+    """Execute a single HttpRequest with retry on 429/5xx transient errors."""
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            return req.execute()
+        except Exception as exc:
+            if attempt == _MAX_RETRIES or not _is_retryable(exc):
+                raise
+            delay = _backoff_seconds(attempt, exc)
+            print(
+                f"  retry {attempt + 1}/{_MAX_RETRIES} after {delay:.1f}s "
+                f"(HTTP {_http_status(exc)}): {exc}",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+
+def _run_batch(
+    svc, request_factories: dict[str, Callable[[], object]]
+) -> dict[str, dict]:
+    """Execute {request_id: factory()} via BatchHttpRequest with per-sub-request retry.
+
+    Factories (not pre-built HttpRequest objects) so each retry can mint a fresh
+    request — googleapiclient's HttpRequest is not guaranteed re-executable
+    after an error. Retries only the failing sub-requests, not the whole batch.
     """
     results: dict[str, dict] = {}
-    errors: list[tuple[str, Exception]] = []
+    pending: dict[str, Callable[[], object]] = dict(request_factories)
 
-    def cb(request_id, response, exception):
-        if exception is not None:
-            errors.append((request_id, exception))
-        else:
-            results[request_id] = response
+    for attempt in range(_MAX_RETRIES + 1):
+        if not pending:
+            return results
 
-    items = list(requests_by_id.items())
-    for start in range(0, len(items), _BATCH_SIZE):
-        batch = svc.new_batch_http_request(callback=cb)
-        for rid, req in items[start:start + _BATCH_SIZE]:
-            batch.add(req, request_id=rid)
-        batch.execute()
+        retry_pending: dict[str, Callable[[], object]] = {}
+        retry_excs: list[BaseException] = []
+        fatal: tuple[str, BaseException] | None = None
 
-    if errors:
-        rid, exc = errors[0]
-        raise RuntimeError(f"batch sub-request {rid} failed: {exc}") from exc
+        def cb(request_id, response, exception):
+            nonlocal fatal
+            if exception is None:
+                results[request_id] = response
+            elif _is_retryable(exception):
+                retry_pending[request_id] = pending[request_id]
+                retry_excs.append(exception)
+            elif fatal is None:
+                fatal = (request_id, exception)
+
+        items = list(pending.items())
+        for start in range(0, len(items), _BATCH_SIZE):
+            batch = svc.new_batch_http_request(callback=cb)
+            for rid, factory in items[start:start + _BATCH_SIZE]:
+                batch.add(factory(), request_id=rid)
+            batch.execute()
+
+        if fatal is not None:
+            rid, exc = fatal
+            raise RuntimeError(f"batch sub-request {rid} failed: {exc}") from exc
+
+        if not retry_pending:
+            return results
+
+        if attempt == _MAX_RETRIES:
+            rid = next(iter(retry_pending))
+            raise RuntimeError(
+                f"batch sub-request {rid} still failing after "
+                f"{_MAX_RETRIES} retries (last HTTP {_http_status(retry_excs[-1])})"
+            )
+
+        # Honor the longest Retry-After across failing sub-requests, else
+        # exponential backoff.
+        delay = max(_backoff_seconds(attempt, exc) for exc in retry_excs)
+        print(
+            f"  batch retry {attempt + 1}/{_MAX_RETRIES}: "
+            f"{len(retry_pending)} sub-request(s), sleeping {delay:.1f}s",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
+        pending = retry_pending
+
     return results
+
+
+def fetch_mac_device_users(svc) -> dict[str, list[dict]]:
+    """deviceId -> [{'name', 'userEmail'}, ...] for every Mac DeviceUser, bulk paginated.
+
+    Single `parent="devices/-"` paginated call across the whole tenant. Slower
+    per-call than per-device fan-out but uses far fewer quota units, which is
+    the binding constraint on noisy tenants. Caller intersects the result with
+    the post-filter survivor set to drop attribution for pruned devices.
+    """
+    by_device: dict[str, list[dict]] = {}
+    req = svc.devices().deviceUsers().list(
+        parent="devices/-",
+        customer="customers/my_customer",
+        filter="type:mac",
+        fields="deviceUsers(name,userEmail),nextPageToken",
+    )
+    while req is not None:
+        resp = _execute(req)
+        for du in resp.get("deviceUsers", []) or []:
+            device_id = _device_id(du.get("name", ""))
+            if not device_id:
+                continue
+            by_device.setdefault(device_id, []).append({
+                "name": du.get("name", ""),
+                "userEmail": du.get("userEmail", ""),
+            })
+        req = svc.devices().deviceUsers().list_next(req, resp)
+    return by_device
 
 
 def extract_browser(full_device: dict) -> str:
@@ -130,20 +232,32 @@ def extract_browser(full_device: dict) -> str:
     return ""
 
 
+def _parse_sync(d: dict) -> datetime | None:
+    """RFC 3339 lastSyncTime -> timezone-aware datetime, or None if missing/invalid."""
+    ts = d.get("lastSyncTime")
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
 def list_mac_devices(
     creds: service_account.Credentials,
     view: str,
     with_clients: bool,
+    last_sync_days: int,
+    include_browser: bool,
     timing: dict | None = None,
 ):
     def record(label: str, t_start: float) -> None:
         if timing is not None:
             timing[label] = time.perf_counter() - t_start
 
-    # Two service instances so the two batched fan-outs below can run on
-    # separate threads — httplib2 (under the discovery client) is not
-    # thread-safe per-instance, so we don't want both threads sharing one svc.
-    # static_discovery=True keeps each build() ~4ms (no network).
+    # Two service instances so the two batched/paginated calls below can run
+    # on separate threads — httplib2 (under the discovery client) is not
+    # thread-safe per-instance.
     t = time.perf_counter()
     svc = build(
         "cloudidentity", "v1",
@@ -159,109 +273,146 @@ def list_mac_devices(
     )
     record("discovery build (x2)", t)
 
-    # Step 1: devices.list — we need device names before we can fan out the
-    # per-device deviceUsers.list and devices.get calls. fields mask trims the
-    # payload to just `name` since we re-fetch the full record via devices.get.
+    # Step 1: devices.list with expanded projection — we need lastSyncTime
+    # and serialNumber for client-side filter + dedup, and the rest for the
+    # output table. The Cloud Identity API does NOT support filtering on
+    # lastSyncTime or "serial-non-empty" server-side, so this is the smallest
+    # set the API will give us pre-prune.
     t = time.perf_counter()
+    list_fields = (
+        "devices(name,serialNumber,lastSyncTime,model,osVersion,assetTag,"
+        "encryptionState,hostname,deviceType),nextPageToken"
+    )
     summaries: list[dict] = []
     req = svc.devices().list(
         customer="customers/my_customer",
         filter="type:mac",
         view=view,
-        fields="devices(name),nextPageToken",
+        fields=list_fields,
     )
     while req is not None:
-        resp = req.execute()
+        resp = _execute(req)
         summaries.extend(resp.get("devices", []))
         req = svc.devices().list_next(req, resp)
-    record("devices.list", t)
+    record(f"devices.list (raw_n={len(summaries)})", t)
 
-    device_names = [d["name"] for d in summaries]
+    # Step 2: client-side filter (active + serialed) + dedup by serial,
+    # keeping the most recent record per serial (by lastSyncTime).
+    t = time.perf_counter()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=last_sync_days)
+    serial_to_device_ids: dict[str, set[str]] = {}
+    survivors_by_serial: dict[str, dict] = {}
+    for d in summaries:
+        serial = (d.get("serialNumber") or "").strip()
+        if not serial:
+            continue
+        sync = _parse_sync(d)
+        if sync is None or sync < cutoff:
+            continue
+        device_id = _device_id(d.get("name", ""))
+        if device_id:
+            serial_to_device_ids.setdefault(serial, set()).add(device_id)
+        existing = survivors_by_serial.get(serial)
+        existing_sync = _parse_sync(existing) if existing else None
+        if existing_sync is None or existing_sync < sync:
+            survivors_by_serial[serial] = d
+    record(f"filter+dedup (survivors_n={len(survivors_by_serial)})", t)
 
-    # Step 2: parallel fan-out — per-device deviceUsers.list batched + per-device
-    # devices.get batched. Both depend on device names from step 1; neither
-    # depends on the other. Each batch goes through its own service instance.
-    def _fetch_users() -> tuple[dict[str, list[dict]], float]:
+    survivor_names = [d["name"] for d in survivors_by_serial.values()]
+
+    # Step 3: parallel fan-out for the surviving set.
+    # - bulk deviceUsers.list (one paginated call across the tenant; the
+    #   single quota unit per page is cheaper than per-survivor calls).
+    # - batched devices.get on survivors only — enriches with the EV browser
+    #   attribute. Only runs when the caller opts in via --include-browser.
+    def _fetch_users_bulk() -> tuple[dict[str, list[dict]], float]:
         t0 = time.perf_counter()
-        out = fetch_device_users_per_device(svc, device_names)
+        out = fetch_mac_device_users(svc)
         return out, time.perf_counter() - t0
 
-    def _fetch_full_devices() -> tuple[dict[str, dict], float]:
+    def _fetch_full_survivors() -> tuple[dict[str, dict], float]:
         t0 = time.perf_counter()
-        get_requests = {
-            f"d{i}": svc2.devices().get(name=name)
-            for i, name in enumerate(device_names)
+        if not include_browser or not survivor_names:
+            return {}, time.perf_counter() - t0
+        get_factories: dict[str, Callable[[], object]] = {
+            f"d{i}": (lambda nm=name: svc2.devices().get(name=nm))
+            for i, name in enumerate(survivor_names)
         }
-        get_responses = _run_batch(svc2, get_requests)
-        out = {
-            device_names[int(rid[1:])]: resp
-            for rid, resp in get_responses.items()
-        }
-        return out, time.perf_counter() - t0
+        get_responses = _run_batch(svc2, get_factories)
+        return (
+            {survivor_names[int(rid[1:])]: resp for rid, resp in get_responses.items()},
+            time.perf_counter() - t0,
+        )
 
     t = time.perf_counter()
     with ThreadPoolExecutor(max_workers=2) as pool:
-        f_users = pool.submit(_fetch_users)
-        f_full = pool.submit(_fetch_full_devices)
+        f_users = pool.submit(_fetch_users_bulk)
+        f_full = pool.submit(_fetch_full_survivors)
         users_by_device, users_elapsed = f_users.result()
         full_by_name, full_elapsed = f_full.result()
     parallel_wall = time.perf_counter() - t
     if timing is not None:
-        timing["[parallel] deviceUsers.list batched"] = users_elapsed
-        timing[f"[parallel] devices.get batched (n={len(device_names)})"] = full_elapsed
+        timing["[parallel] deviceUsers.list bulk"] = users_elapsed
+        full_label = f"n={len(survivor_names)}" if include_browser else "skipped"
+        timing[f"[parallel] devices.get batched ({full_label})"] = full_elapsed
         timing["[parallel] section wall"] = parallel_wall
 
+    # clientStates fan-out — survivors only, batched, with retry.
     client_ids_by_du: dict[str, list[str]] = {}
     if with_clients:
         t = time.perf_counter()
-        # ClientState resources are named
-        #   devices/{device}/deviceUsers/{deviceUser}/clientStates/{partner}
-        # where {partner} is a Context-Aware Access partner (Crowdstrike, Jamf,
-        # …). Confirmed empirically: first-party Google clients including
-        # Endpoint Verification do NOT write entries here, so on a tenant with
-        # no CAA partner integrations every list will return empty.
-        #
-        # We don't paginate — in practice each DeviceUser has at most a handful
-        # of ClientStates (one per partner), well under the default page size.
-        all_du_names = [u["name"] for du_list in users_by_device.values() for u in du_list]
-        cs_requests = {
-            f"c{i}": svc.devices().deviceUsers().clientStates().list(
-                parent=du_name,
-                customer="customers/my_customer",
-            )
-            for i, du_name in enumerate(all_du_names)
-        }
-        cs_responses = _run_batch(svc, cs_requests)
-        for rid, resp in cs_responses.items():
-            du_name = all_du_names[int(rid[1:])]
-            ids: list[str] = []
-            for cs in resp.get("clientStates", []) or []:
-                name = cs.get("name", "")
-                tail = name.rsplit("/", 1)[-1] if name else ""
-                if tail:
-                    ids.append(tail)
-            client_ids_by_du[du_name] = ids
-        record(f"clientStates.list batched (n={len(all_du_names)})", t)
+        survivor_du_names: list[str] = []
+        for serial in survivors_by_serial:
+            for dev_id in serial_to_device_ids.get(serial, set()):
+                for u in users_by_device.get(dev_id, []):
+                    if u.get("name"):
+                        survivor_du_names.append(u["name"])
+        if survivor_du_names:
+            cs_factories: dict[str, Callable[[], object]] = {
+                f"c{i}": (
+                    lambda nm=du_name: svc.devices().deviceUsers().clientStates().list(
+                        parent=nm, customer="customers/my_customer",
+                    )
+                )
+                for i, du_name in enumerate(survivor_du_names)
+            }
+            cs_responses = _run_batch(svc, cs_factories)
+            for rid, resp in cs_responses.items():
+                du_name = survivor_du_names[int(rid[1:])]
+                ids: list[str] = []
+                for cs in resp.get("clientStates", []) or []:
+                    tail = (cs.get("name", "") or "").rsplit("/", 1)[-1]
+                    if tail:
+                        ids.append(tail)
+                client_ids_by_du[du_name] = ids
+        record(f"clientStates.list batched (n={len(survivor_du_names)})", t)
 
-    for d in summaries:
+    # Step 4: yield one row per surviving serial. userEmails is the union
+    # across ALL device records that share this serial (multi-user Macs).
+    for serial, d in survivors_by_serial.items():
         full = full_by_name.get(d["name"], {})
-        # Merge fields the summary view omitted (e.g. hostname, EV attributes).
         for k, v in full.items():
             d.setdefault(k, v)
-        users = users_by_device.get(_device_id(d.get("name", "")), [])
-        # Dedupe: Google creates a new DeviceUser record per sign-in session,
-        # so a frequently-used device yields many records with the same email.
-        d["userEmails"] = list(dict.fromkeys(
-            u["userEmail"] for u in users if u.get("userEmail")
-        ))
-        d["browser"] = extract_browser(full)
+
+        emails: dict[str, None] = {}
+        for dev_id in serial_to_device_ids.get(serial, set()):
+            for u in users_by_device.get(dev_id, []):
+                ue = u.get("userEmail")
+                if ue:
+                    emails[ue] = None
+        d["userEmails"] = list(emails)
+
+        d["browser"] = extract_browser(full) if include_browser else ""
+
         if with_clients:
             seen: list[str] = []
-            for u in users:
-                for cid in client_ids_by_du.get(u["name"], []):
-                    if cid not in seen:
-                        seen.append(cid)
+            for dev_id in serial_to_device_ids.get(serial, set()):
+                for u in users_by_device.get(dev_id, []):
+                    for cid in client_ids_by_du.get(u.get("name", ""), []):
+                        if cid not in seen:
+                            seen.append(cid)
             d["clientIds"] = seen
+
         yield d
 
 
@@ -287,11 +438,12 @@ def classify_signals(d: dict) -> str:
     return "unknown"
 
 
-def render_table(devices: list[dict], with_clients: bool) -> str:
+def render_table(devices: list[dict], with_clients: bool, include_browser: bool) -> str:
     def row(d: dict) -> tuple:
-        base = (
-            ", ".join(d.get("userEmails") or []) or "-",
-            d.get("browser") or "-",
+        base: tuple = (", ".join(d.get("userEmails") or []) or "-",)
+        if include_browser:
+            base = base + (d.get("browser") or "-",)
+        base = base + (
             classify_signals(d),
             d.get("serialNumber", "-"),
             d.get("model", "-"),
@@ -304,7 +456,10 @@ def render_table(devices: list[dict], with_clients: bool) -> str:
         return base
 
     rows = [row(d) for d in devices]
-    headers = ("USER", "BROWSER", "SIGNALS", "SERIAL", "MODEL", "ASSET_TAG", "ENCRYPTION", "LAST_SYNC")
+    headers: tuple = ("USER",)
+    if include_browser:
+        headers = headers + ("BROWSER",)
+    headers = headers + ("SIGNALS", "SERIAL", "MODEL", "ASSET_TAG", "ENCRYPTION", "LAST_SYNC")
     if with_clients:
         headers = headers + ("CLIENTS",)
     widths = [
@@ -328,6 +483,20 @@ def main() -> int:
              "Endpoint Verification Macs live).",
     )
     p.add_argument(
+        "--last-sync-days", type=int, default=30,
+        help="Drop devices whose lastSyncTime is older than N days (default: 30). "
+             "This script's purpose is the active fleet; widen for occasional "
+             "audits, but expect more quota pressure.",
+    )
+    p.add_argument(
+        "--include-browser", action="store_true",
+        help="Add the BROWSER column (Chrome version per device from the EV "
+             "signal block). Costs one extra devices.get call per survivor — "
+             "off by default to keep the API-call footprint low. Worth turning "
+             "on for ad-hoc audits where you want to see which Chrome versions "
+             "are in the fleet.",
+    )
+    p.add_argument(
         "--clients",
         action="store_true",
         help="Also list 3rd-party Context-Aware Access partner ClientStates per "
@@ -336,20 +505,14 @@ def main() -> int:
              "Endpoint Verification do not appear here.",
     )
     p.add_argument(
-        "--exclude-stale", action="store_true",
-        help="Drop devices the classifier labels 'stale / minimal' (no serial, "
-             "no encryption state — typically dormant records with no recent signal).",
-    )
-    p.add_argument(
-        "--require-serial", action="store_true",
-        help="Drop devices with no serialNumber (a stricter cut than "
-             "--exclude-stale; also drops 'browser only' records).",
-    )
-    p.add_argument(
         "--timing", action="store_true",
         help="Print a per-phase wall-clock breakdown to stderr after the run.",
     )
     args = p.parse_args()
+
+    if args.last_sync_days < 1:
+        print("--last-sync-days must be >= 1", file=sys.stderr)
+        return 2
 
     try:
         sa_email = os.environ["SA_EMAIL"]
@@ -377,19 +540,25 @@ def main() -> int:
     if timing is not None:
         timing["auth refresh (signJwt + token)"] = time.perf_counter() - t
 
-    devices = list(list_mac_devices(creds, args.view, args.clients, timing=timing))
-    if args.exclude_stale:
-        devices = [d for d in devices if classify_signals(d) != "stale / minimal"]
-    if args.require_serial:
-        devices = [d for d in devices if d.get("serialNumber")]
+    devices = list(list_mac_devices(
+        creds,
+        view=args.view,
+        with_clients=args.clients,
+        last_sync_days=args.last_sync_days,
+        include_browser=args.include_browser,
+        timing=timing,
+    ))
 
     t = time.perf_counter()
     if args.json:
         json.dump(devices, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
     else:
-        print(render_table(devices, args.clients))
-        print(f"\n{len(devices)} Mac device(s).")
+        print(render_table(devices, args.clients, args.include_browser))
+        print(
+            f"\n{len(devices)} Mac device(s) "
+            f"active in the last {args.last_sync_days} day(s) with a serial number."
+        )
     if timing is not None:
         timing["render + print"] = time.perf_counter() - t
         wall = time.perf_counter() - _T_MODULE_START

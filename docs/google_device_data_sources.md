@@ -128,9 +128,35 @@ hardware-only, one browser-only — and there is no clean join key (different
 `deviceId`, possibly different `serialNumber` because one row has it and the
 other doesn't).
 
-The classifier in `list_mac_devices.py` doesn't attempt to merge these. It
-labels each row by the signal mix actually present in that record, which is
-the most honest thing to surface without inventing a fake join.
+The classifier in `list_mac_devices.py` labels each row by the signal mix
+actually present in that record. To make the default report usable on a
+real tenant without merging fictional fields, the script also prunes the
+noisy long tail before display — see below.
+
+## Why `list_mac_devices.py` filters by default
+
+A real tenant accumulates many Device records per physical Mac: per user
+session, per OS version, per first-party app that has reported in. On a
+~90-user tenant we observed enough records to blow through Google's
+**1500 read requests / minute** quota on `cloudidentity.googleapis.com`
+when fanning out per-device. There's no server-side filter for
+"recently active" or "has a serial," so we prune client-side after
+`devices.list`.
+
+Defaults:
+
+1. Keep only records with a non-empty `serialNumber`.
+2. Keep only records with `lastSyncTime` within the trailing
+   `--last-sync-days` (default 30).
+3. Dedupe by `serialNumber`, keeping the most recent record per serial.
+   For multi-user Macs, the row's `USER` column is the union of every
+   email Cloud Identity has attributed to any record sharing that serial.
+
+This default reflects "the active managed fleet, one row per physical
+Mac." For audits of dormant or signal-poor records (no serial, very old
+sync, `stale / minimal` classifier), a future sibling script will surface
+the inverse view — that's intentionally not this script's job, so its
+defaults don't drift toward exhaustive enumeration.
 
 ## Signal-mix classifier (what shows up in the `SIGNALS` column)
 
@@ -142,42 +168,34 @@ the most honest thing to surface without inventing a fake join.
 | `stale / minimal` | — | — | — | Old / minimal registration (`model == "Mac OS"`) |
 | `unknown` | other combination | other combination | other combination | — |
 
-## Sample output
+## Sample output (default filter)
 
 ```
-USER                SIGNALS             SERIAL         MODEL           ASSET_TAG  ENCRYPTION     LAST_SYNC
-------------------  ------------------  -------------  --------------  ---------  -------------  ------------------------
-alice@example.com   browser + hardware  C02ZZZZZZZZZ1  MacBook Pro     -          ENCRYPTED      2026-05-29T18:19:07.448Z
-alice@example.com   browser only        -              MacBookPro17,1  -          ENCRYPTED      2026-05-29T18:14:50.631Z
-bob@example.com     hardware only       C02ZZZZZZZZZ2  Mac16,6         -          -              2026-05-29T16:02:30.005Z
-carol@example.com   browser only        -              Mac16,13        -          ENCRYPTED      2026-05-29T17:54:40.524Z
-dave@example.com    browser only        -              Mac16,5         -          ENCRYPTED      2026-05-29T13:35:07.057Z
-dave@example.com    browser only        -              Mac14,15        -          ENCRYPTED      2026-05-26T15:40:42.689Z
-bob@example.com     browser only        -              Mac16,6         -          NOT_ENCRYPTED  2026-05-25T16:48:47.098Z
-bob@example.com     stale / minimal     -              Mac OS          -          -              2026-05-25T19:10:59.989Z
-alice@example.com   stale / minimal     -              Mac OS          -          -              2026-05-24T18:39:28.908Z
+USER                              SIGNALS             SERIAL         MODEL        ASSET_TAG  ENCRYPTION  LAST_SYNC
+--------------------------------  ------------------  -------------  -----------  ---------  ----------  ------------------------
+alice@example.com                 browser + hardware  C02ZZZZZZZZZ1  MacBook Pro  -          ENCRYPTED   2026-05-29T18:19:07.448Z
+bob@example.com, eve@example.com  hardware only       C02ZZZZZZZZZ2  Mac16,6      -          -           2026-05-29T16:02:30.005Z
 ```
+
+Add `--include-browser` to pull each device's Chrome version (from the EV
+signal block) as an extra column — at the cost of one `devices.get` call
+per surviving device.
 
 Reading this:
 
-- **alice** appears twice: once as `browser + hardware` (EV + native helper on
-  her current MacBook Pro) and once as `browser only` (an older MacBookPro17,1
-  she still syncs Chrome on without the native helper installed). Two physical
-  Macs, both encrypted, both attributable.
-- **bob** has `hardware only` for his Mac16,6 — Drive for desktop is reporting
-  the serial, but nothing is reporting encryption status. **Action item:** EV
-  isn't installed on this machine; the serial is there but FileVault state is
-  unknown.
-- **bob** also has a `browser only` Mac16,6 row that is `NOT_ENCRYPTED`. This
-  might be the same physical Mac as the hardware-only row above, but without
-  a shared join key we can't be certain. The right move is to follow up with
-  bob directly.
-- **carol** and **dave** only have managed-Chrome signals; their machines
-  are reporting encryption status but not serial. If you need serial for
-  inventory, ask them to install either EV's native helper or Drive for
-  desktop.
-- The two `stale / minimal` rows are old registrations and can be ignored or
-  pruned.
+- One row per physical Mac (deduped by `serialNumber`).
+- **alice's** Mac has the EV extension *and* native helper, so a single
+  record carries both `serialNumber` and `encryptionState` and we know
+  FileVault is on.
+- **bob's** Mac is shared with **eve** (both have synced into it under
+  managed identities); Drive for desktop is reporting the serial, but
+  nothing on this machine is reporting encryption state. **Action item:**
+  install EV on this machine so FileVault status surfaces.
+- Records that fail the default filter — no serial (browser-only Chrome
+  sessions like alice's older MacBookPro17,1, or carol/dave's machines
+  that only have managed Chrome), or sync older than 30 days, or the
+  classic `stale / minimal` model="Mac OS" placeholders — are dropped
+  from this view. A future "outliers" report will surface them.
 
 ## Practical implications
 
