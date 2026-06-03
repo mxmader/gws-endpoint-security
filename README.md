@@ -85,9 +85,11 @@ https://www.googleapis.com/auth/admin.directory.user.readonly
 What each scope powers:
 
 - `cloud-identity.devices.readonly` — `list_mac_devices.py`,
-  `list_users_with_macs.py` (Mac correlation).
+  `list_users_with_macs.py`, `list_caa_events.py` (all use device list /
+  get; the Mac correlation in CAA events is a `deviceId` join against a
+  pre-built catalog).
 - `admin.reports.audit.readonly` — `list_app_authorizations.py`,
-  `list_signins.py`.
+  `list_signins.py`, `list_caa_events.py`.
 - `cloud-identity.devices` (write) — `prune_devices.py`.
 - `admin.directory.user.readonly` — `list_users_with_macs.py` (user list).
 

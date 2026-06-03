@@ -14,13 +14,14 @@ OUTCOME column values:
   was caused by some *other* policy condition failing.
 - `unsatisfied` — the named access level was the failing condition.
 
-CAA_DEVICE_ID format note: empirically these are EV-issued **raw resource
-IDs**, not Cloud Identity Device resource IDs (the two are both 43-char
-base64url but live in different namespaces). Direct `devices.get` on a raw
-resource ID returns 400. The script resolves via the documented chain
-`devices.deviceUsers.lookup(parent="devices/-", rawResourceId=…)` → extract
-parent device → `devices.get`. Lookup failures (400, 404) on either step
-blank out the device columns rather than failing the run.
+CAA_DEVICE_ID format note: the value matches the Cloud Identity Device
+resource's `deviceId` field, which is distinct from its `name` (resource
+path). The script enumerates Mac devices once up front (scoped to one user
+when `--user` is set, full tenant otherwise) and joins CAA events to that
+catalog by `deviceId` dict lookup — no per-event API call needed. Events
+whose `CAA_DEVICE_ID` doesn't appear in the catalog (different origin: a
+non-Mac device, a deleted Mac, or a user-scoped run that doesn't include
+the device) land with empty device columns.
 
 Auth: keyless. Uses both `admin.reports.audit.readonly` (CAA events) and
 `cloud-identity.devices.readonly` (device records). Both scopes must be in
@@ -49,6 +50,7 @@ from list_mac_devices import (
     build_credentials,
     classify_signals,
     decode_model,
+    fetch_user_device_users,
     write_formatted,
 )
 
@@ -147,145 +149,78 @@ def flatten(
     return rows
 
 
-def _device_name_from_du_name(du_name: str) -> str:
-    """Extract `devices/{deviceId}` from a DeviceUser resource name."""
-    parts = du_name.split("/")
-    if len(parts) >= 2 and parts[0] == "devices":
-        return f"devices/{parts[1]}"
-    return ""
+_DEVICE_FIELDS = (
+    "name,deviceId,serialNumber,lastSyncTime,model,osVersion,"
+    "assetTag,encryptionState,hostname,deviceType"
+)
 
 
-def fetch_devices(
-    creds, device_ids: set[str], *, debug: bool = False,
+def build_device_catalog(
+    creds, user_email: str | None = None, *, debug: bool = False,
 ) -> dict[str, dict]:
-    """Resolve CAA_DEVICE_ID values to Cloud Identity Device records.
+    """Build `{deviceId: device_record}` for CAA-event correlation.
 
-    `CAA_DEVICE_ID` is empirically the EV-issued **raw resource ID**, not the
-    Cloud Identity Device resource ID. The two look identical (both 43-char
-    base64url) but live in different namespaces — direct
-    `devices.get(name="devices/<caa_id>")` returns 400 because the public API
-    only knows Cloud Identity device IDs.
+    The Cloud Identity Device resource carries two identifiers:
+      - `name`: the resource path (`devices/{opaque}`) used by devices.get
+      - `deviceId`: the EV-style identifier (43-char base64url) emitted by
+        the CAA event log as `CAA_DEVICE_ID`
+    Joining CAA events to Device records is a `deviceId` dict lookup, NOT a
+    `devices.get(name=<caa_id>)` call (the latter 400s, since CAA IDs aren't
+    valid resource paths).
 
-    The correct chain is:
-      1. `devices.deviceUsers.lookup(parent="devices/-/deviceUsers",
-         rawResourceId=<caa_id>)` → returns DeviceUser resource names like
-         `devices/{realId}/deviceUsers/{userId}`. (Cloud Identity's discovery
-         doc requires the `parent` to include the `/deviceUsers` suffix; `-`
-         is the wildcard for "any device.")
-      2. Extract the parent `devices/{realId}` and call `devices.get` on it.
+    Scoping:
+      - `user_email=None`: enumerate all Mac devices in the tenant via
+        `devices.list(filter=type:mac)`.
+      - `user_email=...`: scope to that user's devices via the focused path
+        (bulk deviceUsers.list + filter, then batched devices.get on the
+        resulting device names). Matches the `--user` mode in
+        list_mac_devices.py.
 
-    Both rounds are batched in the non-debug path. 400/404 on either step is
-    silently tolerated — the caller blanks out the device columns for that
-    row (no semantic fallback to user-email join, per project preference).
-
-    Keys the result by the **raw CAA_DEVICE_ID** string so callers look up by
-    what's in the event.
-
-    When `debug=True`, the chain runs sequentially and each request URI +
-    response status is logged to stderr.
+    Either way, the returned map is keyed by `deviceId` so the caller's
+    per-event lookup is O(1) with no additional API calls.
     """
-    if not device_ids:
-        return {}
     svc = build(
         "cloudidentity", "v1",
         credentials=creds,
         cache_discovery=False,
         static_discovery=True,
     )
-    id_list = sorted(device_ids)
 
-    if debug:
-        result: dict[str, dict] = {}
-        for did in id_list:
-            lookup_req = svc.devices().deviceUsers().lookup(
-                parent="devices/-/deviceUsers",
-                rawResourceId=did,
-            )
-            print(f"[debug] LOOKUP {lookup_req.uri}", file=sys.stderr)
-            try:
-                lookup_resp = lookup_req.execute()
-                names = lookup_resp.get("names") or []
-                print(
-                    f"[debug]   -> 200 OK: {len(names)} DeviceUser name(s)",
-                    file=sys.stderr,
+    devices: list[dict] = []
+    if user_email:
+        users_by_device, _ = fetch_user_device_users(svc, user_email)
+        device_names = [f"devices/{did}" for did in users_by_device.keys()]
+        if device_names:
+            factories: dict[str, Callable[[], object]] = {
+                f"d{i}": (
+                    lambda nm=name: svc.devices().get(
+                        name=nm, customer="customers/my_customer",
+                    )
                 )
-            except HttpError as exc:
-                status = getattr(getattr(exc, "resp", None), "status", "?")
-                print(f"[debug]   -> {status}: {exc}", file=sys.stderr)
-                continue
-
-            if not names:
-                continue
-            device_name = _device_name_from_du_name(names[0])
-            if not device_name:
-                print(f"[debug]   unexpected DU name shape: {names[0]}", file=sys.stderr)
-                continue
-
-            get_req = svc.devices().get(
-                name=device_name,
-                customer="customers/my_customer",
-            )
-            print(f"[debug] GET {get_req.uri}", file=sys.stderr)
-            try:
-                resp = get_req.execute()
-                print(f"[debug]   -> 200 OK (resolved)", file=sys.stderr)
-                result[did] = resp
-            except HttpError as exc:
-                status = getattr(getattr(exc, "resp", None), "status", "?")
-                print(f"[debug]   -> {status}: {exc}", file=sys.stderr)
-        return result
-
-    # Batched path: two rounds.
-    #
-    # Round 1: deviceUsers.lookup by rawResourceId for each CAA_DEVICE_ID.
-    lookup_factories: dict[str, Callable[[], object]] = {
-        f"l{i}": (
-            lambda did=did: svc.devices().deviceUsers().lookup(
-                parent="devices/-/deviceUsers",
-                rawResourceId=did,
-            )
+                for i, name in enumerate(device_names)
+            }
+            responses = _run_batch(svc, factories, ignore_statuses={400, 404})
+            devices = [resp for resp in responses.values() if resp]
+    else:
+        req = svc.devices().list(
+            customer="customers/my_customer",
+            filter="type:mac",
+            view="USER_ASSIGNED_DEVICES",
+            fields=f"devices({_DEVICE_FIELDS}),nextPageToken",
         )
-        for i, did in enumerate(id_list)
-    }
-    lookup_responses = _run_batch(svc, lookup_factories, ignore_statuses={400, 404})
+        while req is not None:
+            resp = _execute(req)
+            devices.extend(resp.get("devices", []))
+            req = svc.devices().list_next(req, resp)
 
-    # Map CAA_DEVICE_ID -> resolved devices/{realId}.
-    device_name_by_caa_id: dict[str, str] = {}
-    for rid, resp in lookup_responses.items():
-        caa_id = id_list[int(rid[1:])]
-        if not resp:
-            continue
-        names = resp.get("names") or []
-        if not names:
-            continue
-        dn = _device_name_from_du_name(names[0])
-        if dn:
-            device_name_by_caa_id[caa_id] = dn
-
-    if not device_name_by_caa_id:
-        return {}
-
-    # Round 2: devices.get on each resolved name. Multiple CAA IDs may map to
-    # the same device record (same Mac, different EV signal sessions); the
-    # batch dedupes nothing — each CAA ID gets its own sub-request — but the
-    # cost is small and the bookkeeping stays simple.
-    caa_ids_to_fetch = list(device_name_by_caa_id.keys())
-    get_factories: dict[str, Callable[[], object]] = {
-        f"g{i}": (
-            lambda dn=device_name_by_caa_id[cid]: svc.devices().get(
-                name=dn,
-                customer="customers/my_customer",
-            )
+    catalog = {d["deviceId"]: d for d in devices if d.get("deviceId")}
+    if debug:
+        print(
+            f"[debug] device catalog: {len(catalog)} entries "
+            f"({'user-scoped' if user_email else 'tenant-wide Macs'})",
+            file=sys.stderr,
         )
-        for i, cid in enumerate(caa_ids_to_fetch)
-    }
-    get_responses = _run_batch(svc, get_factories, ignore_statuses={400, 404})
-
-    return {
-        caa_ids_to_fetch[int(rid[1:])]: resp
-        for rid, resp in get_responses.items()
-        if resp
-    }
+    return catalog
 
 
 def attach_device_fields(rows: list[dict], device_by_id: dict[str, dict]) -> None:
@@ -429,9 +364,8 @@ def main() -> int:
     )
     p.add_argument(
         "--debug", action="store_true",
-        help="Issue device.get calls sequentially (not batched) and log each "
-             "request URI + response status code to stderr. Use to diagnose "
-             "CAA-to-Cloud-Identity device-ID correlation failures.",
+        help="Log device-catalog size to stderr (counts entries that were "
+             "available for CAA event correlation).",
     )
     args = p.parse_args()
 
@@ -485,10 +419,11 @@ def main() -> int:
         )
 
     t = time.perf_counter()
-    unique_device_ids = {r["device_id"] for r in rows if r.get("device_id")}
-    device_by_id = fetch_devices(creds, unique_device_ids, debug=args.debug)
+    device_by_id = build_device_catalog(
+        creds, user_email=args.user, debug=args.debug,
+    )
     if args.timing:
-        timing[f"deviceUsers.lookup + devices.get (n_requested={len(unique_device_ids)}, n_resolved={len(device_by_id)})"] = (
+        timing[f"device catalog ({'user-scoped' if args.user else 'tenant-wide'}, n={len(device_by_id)})"] = (
             time.perf_counter() - t
         )
 
