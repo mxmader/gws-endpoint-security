@@ -167,9 +167,11 @@ def fetch_devices(
     only knows Cloud Identity device IDs.
 
     The correct chain is:
-      1. `devices.deviceUsers.lookup(parent="devices/-", rawResourceId=<caa_id>)`
-         → returns DeviceUser resource names like
-         `devices/{realId}/deviceUsers/{userId}`.
+      1. `devices.deviceUsers.lookup(parent="devices/-/deviceUsers",
+         rawResourceId=<caa_id>)` → returns DeviceUser resource names like
+         `devices/{realId}/deviceUsers/{userId}`. (Cloud Identity's discovery
+         doc requires the `parent` to include the `/deviceUsers` suffix; `-`
+         is the wildcard for "any device.")
       2. Extract the parent `devices/{realId}` and call `devices.get` on it.
 
     Both rounds are batched in the non-debug path. 400/404 on either step is
@@ -196,7 +198,7 @@ def fetch_devices(
         result: dict[str, dict] = {}
         for did in id_list:
             lookup_req = svc.devices().deviceUsers().lookup(
-                parent="devices/-",
+                parent="devices/-/deviceUsers",
                 rawResourceId=did,
             )
             print(f"[debug] LOOKUP {lookup_req.uri}", file=sys.stderr)
@@ -239,7 +241,7 @@ def fetch_devices(
     lookup_factories: dict[str, Callable[[], object]] = {
         f"l{i}": (
             lambda did=did: svc.devices().deviceUsers().lookup(
-                parent="devices/-",
+                parent="devices/-/deviceUsers",
                 rawResourceId=did,
             )
         )
