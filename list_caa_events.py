@@ -38,6 +38,7 @@ from typing import Callable
 
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from list_mac_devices import (
     _execute,
@@ -162,7 +163,9 @@ def _normalize_device_name(raw: str) -> str:
     return f"devices/{raw}"
 
 
-def fetch_devices(creds, device_ids: set[str]) -> dict[str, dict]:
+def fetch_devices(
+    creds, device_ids: set[str], *, debug: bool = False,
+) -> dict[str, dict]:
     """Batched devices.get for the set of CAA-referenced device IDs.
 
     Keys the result by the **raw** CAA_DEVICE_ID string so the caller can
@@ -175,6 +178,10 @@ def fetch_devices(creds, device_ids: set[str]) -> dict[str, dict]:
     status means "can't resolve to a Cloud Identity Device"; the caller
     renders the device columns as empty for those rows (no fallback —
     preserving the per-device semantics of CAA decisions).
+
+    When `debug=True`, the call is issued sequentially (one request at a
+    time, not batched) and each request URI + response status is logged to
+    stderr. Useful for diagnosing correlation failures.
     """
     if not device_ids:
         return {}
@@ -185,6 +192,21 @@ def fetch_devices(creds, device_ids: set[str]) -> dict[str, dict]:
         static_discovery=True,
     )
     id_list = sorted(device_ids)
+
+    if debug:
+        result: dict[str, dict] = {}
+        for did in id_list:
+            req = svc.devices().get(name=_normalize_device_name(did))
+            print(f"[debug] GET {req.uri}", file=sys.stderr)
+            try:
+                resp = req.execute()
+                print(f"[debug]   -> 200 OK (resolved)", file=sys.stderr)
+                result[did] = resp
+            except HttpError as exc:
+                status = getattr(getattr(exc, "resp", None), "status", "?")
+                print(f"[debug]   -> {status}: {exc}", file=sys.stderr)
+        return result
+
     factories: dict[str, Callable[[], object]] = {
         f"d{i}": (lambda did=did: svc.devices().get(name=_normalize_device_name(did)))
         for i, did in enumerate(id_list)
@@ -266,8 +288,8 @@ def render_table(rows: list[dict]) -> str:
         (
             r[0],                # TIME
             r[1],                # USER
-            shrink(r[2], 30),    # DEVICE_ID
-            shrink(r[3], 24),    # APP
+            r[2],                # DEVICE_ID (full width — useful for debugging)
+            r[3],                # APP (full width)
             shrink(r[4], 50),    # BLOCKED_API
             r[5],                # DEVICE_STATE
             shrink(r[6], 40),    # DEVICE_RISKS
@@ -336,6 +358,12 @@ def main() -> int:
         "--timing", action="store_true",
         help="Print a per-phase wall-clock breakdown to stderr.",
     )
+    p.add_argument(
+        "--debug", action="store_true",
+        help="Issue device.get calls sequentially (not batched) and log each "
+             "request URI + response status code to stderr. Use to diagnose "
+             "CAA-to-Cloud-Identity device-ID correlation failures.",
+    )
     args = p.parse_args()
 
     try:
@@ -389,7 +417,7 @@ def main() -> int:
 
     t = time.perf_counter()
     unique_device_ids = {r["device_id"] for r in rows if r.get("device_id")}
-    device_by_id = fetch_devices(creds, unique_device_ids)
+    device_by_id = fetch_devices(creds, unique_device_ids, debug=args.debug)
     if args.timing:
         timing[f"devices.get batched (n_requested={len(unique_device_ids)}, n_resolved={len(device_by_id)})"] = (
             time.perf_counter() - t
