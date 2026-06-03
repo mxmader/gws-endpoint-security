@@ -196,7 +196,10 @@ def fetch_devices(
     if debug:
         result: dict[str, dict] = {}
         for did in id_list:
-            req = svc.devices().get(name=_normalize_device_name(did))
+            req = svc.devices().get(
+                name=_normalize_device_name(did),
+                customer="customers/my_customer",
+            )
             print(f"[debug] GET {req.uri}", file=sys.stderr)
             try:
                 resp = req.execute()
@@ -208,7 +211,12 @@ def fetch_devices(
         return result
 
     factories: dict[str, Callable[[], object]] = {
-        f"d{i}": (lambda did=did: svc.devices().get(name=_normalize_device_name(did)))
+        f"d{i}": (
+            lambda did=did: svc.devices().get(
+                name=_normalize_device_name(did),
+                customer="customers/my_customer",
+            )
+        )
         for i, did in enumerate(id_list)
     }
     responses = _run_batch(svc, factories, ignore_statuses={400, 404})
