@@ -157,9 +157,15 @@ def fetch_devices(creds, device_ids: set[str]) -> dict[str, dict]:
     """Batched devices.get for the set of CAA-referenced device IDs.
 
     Keys the result by the **raw** CAA_DEVICE_ID string so the caller can
-    look up by what's in the event. 404s are silently tolerated (deleted /
-    unknown / non-Mac device); those entries are absent from the result map
-    and the caller renders the device columns as empty.
+    look up by what's in the event.
+
+    Both 404 and 400 are silently tolerated. The CAA_DEVICE_ID format is not
+    documented and empirically does not always match a Cloud Identity Device
+    resource ID — many values look like EV device fingerprints (43-char
+    base64url) which the API rejects with 400 ("invalid argument"). Either
+    status means "can't resolve to a Cloud Identity Device"; the caller
+    renders the device columns as empty for those rows (no fallback —
+    preserving the per-device semantics of CAA decisions).
     """
     if not device_ids:
         return {}
@@ -174,7 +180,7 @@ def fetch_devices(creds, device_ids: set[str]) -> dict[str, dict]:
         f"d{i}": (lambda did=did: svc.devices().get(name=_normalize_device_name(did)))
         for i, did in enumerate(id_list)
     }
-    responses = _run_batch(svc, factories, ignore_statuses={404})
+    responses = _run_batch(svc, factories, ignore_statuses={400, 404})
     return {
         id_list[int(rid[1:])]: resp
         for rid, resp in responses.items()
