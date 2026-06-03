@@ -14,11 +14,11 @@ OUTCOME column values:
   was caused by some *other* policy condition failing.
 - `unsatisfied` — the named access level was the failing condition.
 
-CAA_DEVICE_ID format is not documented; the script tries the value as a Cloud
-Identity device ID (with the `devices/` prefix prepended when absent) and
-falls back to empty device columns on lookup failure (404 is silently
-tolerated). Spot-checks on a real tenant suggest direct correlation works
-for managed Macs; YMMV for events from non-Mac sources.
+CAA_DEVICE_ID format note: the Reports API typically emits these with an
+extra leading `-` that is NOT part of the underlying Cloud Identity device
+ID — the Admin Console strips it transparently, this script does the same
+in `_normalize_device_name`. Lookup failures (400, 404) blank out the
+device columns rather than failing the run.
 
 Auth: keyless. Uses both `admin.reports.audit.readonly` (CAA events) and
 `cloud-identity.devices.readonly` (device records). Both scopes must be in
@@ -145,11 +145,20 @@ def flatten(
 
 
 def _normalize_device_name(raw: str) -> str:
-    """`CAA_DEVICE_ID` may be a bare ID or a full resource name; normalize."""
+    """`CAA_DEVICE_ID` may be a bare ID or a full resource name; normalize.
+
+    Empirical quirk: the Reports API often emits CAA_DEVICE_ID with an extra
+    leading `-` that is NOT part of the underlying Cloud Identity device ID.
+    The Admin Console strips it transparently; the public REST API does not
+    (it returns 400 because `devices/-...` collides with the wildcard-parent
+    pattern). Strip the leading dash before constructing the resource name.
+    """
     if not raw:
         return ""
     if raw.startswith("devices/"):
         return raw
+    if raw.startswith("-"):
+        raw = raw[1:]
     return f"devices/{raw}"
 
 
