@@ -25,6 +25,11 @@ with domain-wide delegation:
 - [`list_signins.py`](./list_signins.py) — per-user sign-in events with IP,
   login method, and suspicious-flag, from the Admin SDK Reports `login`
   activity log. (Note: browser user-agent is **not** on this surface.)
+- [`list_caa_events.py`](./list_caa_events.py) — Context-Aware Access
+  decision events filtered by access level name, correlated row-by-row
+  with the matching Cloud Identity Device record (same columns
+  `list_mac_devices.py` produces). Tells you which user/device/app
+  combinations are being challenged at the access boundary.
 
 See [docs/google_device_data_sources.md](./docs/google_device_data_sources.md)
 for what signals the device API actually exposes and how to interpret them.
@@ -102,6 +107,7 @@ Read-Only" custom admin role assigned to a service-style account.
 | `prune_devices.py` | Services → **Mobile Device Management** (full — *not* the Read-only sub-privilege) |
 | `list_app_authorizations.py` | Admin API Privileges → **Reports** (Read) |
 | `list_signins.py` | Admin API Privileges → **Reports** (Read) |
+| `list_caa_events.py` | Admin API Privileges → **Reports** (Read) + Services → **Mobile Device Management** (Read) |
 
 A single role bundling all of these (full Mobile Device Management +
 Users (Read) + Reports (Read)) covers every script. The only
