@@ -140,7 +140,13 @@ def flatten(
                 "user": user,
                 "device_id": _param(ev, "CAA_DEVICE_ID"),
                 "app": _param(ev, "CAA_APPLICATION"),
-                "blocked_api": _param(ev, "BLOCKED_API_ACCESS"),
+                # "protected API access" parameter — try both candidate
+                # names (Google's appendix and the Investigation Tool UI
+                # don't agree on the casing/prefix).
+                "protected_api": (
+                    _param(ev, "PROTECTED_API_ACCESS")
+                    or _param(ev, "CAA_PROTECTED_API_ACCESS")
+                ),
                 "device_state": _param(ev, "CAA_DEVICE_STATE"),
                 "device_risks": device_risks,
                 "outcome": outcome,
@@ -250,7 +256,7 @@ def attach_device_fields(rows: list[dict], device_by_id: dict[str, dict]) -> Non
 
 
 HEADERS = (
-    "TIME", "USER", "DEVICE_ID", "APP", "BLOCKED_API", "DEVICE_STATE",
+    "TIME", "USER", "DEVICE_ID", "APP", "PROTECTED_API", "DEVICE_STATE",
     "DEVICE_RISKS", "OUTCOME",
     "SIGNALS", "SERIAL", "MODEL", "OS_VERSION", "HOSTNAME", "ASSET_TAG",
     "ENCRYPTION", "LAST_SYNC",
@@ -266,7 +272,7 @@ def _table_columns(rows: list[dict]) -> list[tuple]:
             r.get("user") or "-",
             r.get("device_id") or "-",
             r.get("app") or "-",
-            r.get("blocked_api") or "-",
+            r.get("protected_api") or "-",
             r.get("device_state") or "-",
             ", ".join(r.get("device_risks") or []) or "-",
             r.get("outcome") or "-",
@@ -294,7 +300,7 @@ def render_table(rows: list[dict]) -> str:
             r[1],                # USER
             r[2],                # DEVICE_ID (full width — useful for debugging)
             r[3],                # APP (full width)
-            shrink(r[4], 50),    # BLOCKED_API
+            shrink(r[4], 50),    # PROTECTED_API
             r[5],                # DEVICE_STATE
             shrink(r[6], 40),    # DEVICE_RISKS
             r[7],                # OUTCOME
