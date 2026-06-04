@@ -224,8 +224,8 @@ def _run_batch(
     return results
 
 
-def fetch_user_device_users(
-    svc, user_email: str,
+def fetch_device_users_for_user(
+    svc, user_email: str, type_filter: str | None = None,
 ) -> tuple[dict[str, list[dict]], bool]:
     """Return ({device_id: [DeviceUser, ...]}, server_side_filtered) for one user.
 
@@ -236,6 +236,10 @@ def fetch_user_device_users(
     with `AND` — we initially used `type:mac AND email:<X>` and the API
     silently returned zero rows. The correct form is `type:mac email:<X>`.
 
+    `type_filter` optionally scopes the server-side query with a `type:<token>`
+    (e.g. `mac`); None filters on `email:<X>` alone, returning the user's
+    devices of every type for the caller to bucket client-side.
+
     Server-side success is verified by also requiring a case-insensitive
     client-side match before keeping a row; if the API still returns nothing
     (e.g., for a tenant where the filter semantics regress), we fall back to
@@ -244,12 +248,16 @@ def fetch_user_device_users(
     """
     target = user_email.lower()
     by_device: dict[str, list[dict]] = {}
+    filt = (
+        f"type:{type_filter} email:{user_email}"
+        if type_filter else f"email:{user_email}"
+    )
 
     try:
         req = svc.devices().deviceUsers().list(
             parent="devices/-",
             customer="customers/my_customer",
-            filter=f"type:mac email:{user_email}",
+            filter=filt,
             fields="deviceUsers(name,userEmail),nextPageToken",
         )
         while req is not None:
@@ -276,28 +284,44 @@ def fetch_user_device_users(
     # Fallback: bulk listing + client-side filter (also our verification path
     # when the server filter returned zero rows).
     by_device = {}
-    for dev_id, dus in fetch_mac_device_users(svc).items():
+    for dev_id, dus in fetch_device_users(svc, type_filter).items():
         filtered = [u for u in dus if (u.get("userEmail") or "").lower() == target]
         if filtered:
             by_device[dev_id] = filtered
     return by_device, False
 
 
-def fetch_mac_device_users(svc) -> dict[str, list[dict]]:
-    """deviceId -> [{'name', 'userEmail'}, ...] for every Mac DeviceUser, bulk paginated.
+def fetch_user_device_users(
+    svc, user_email: str,
+) -> tuple[dict[str, list[dict]], bool]:
+    """Mac-scoped user lookup. Wrapper over `fetch_device_users_for_user(.., 'mac')`."""
+    return fetch_device_users_for_user(svc, user_email, "mac")
+
+
+def fetch_device_users(
+    svc, type_filter: str | None = None,
+) -> dict[str, list[dict]]:
+    """deviceId -> [{'name', 'userEmail'}, ...] for every DeviceUser, bulk paginated.
 
     Single `parent="devices/-"` paginated call across the whole tenant. Slower
     per-call than per-device fan-out but uses far fewer quota units, which is
     the binding constraint on noisy tenants. Caller intersects the result with
     the post-filter survivor set to drop attribution for pruned devices.
+
+    `type_filter` — an Admin SDK "Mobile device search fields" `type:` token
+    (e.g. `mac`, `android`, `ios`) to scope the listing server-side, or None to
+    list device-users of every type. Note these tokens are space-separated, not
+    `AND`-joined — see `fetch_user_device_users` for the gory detail.
     """
     by_device: dict[str, list[dict]] = {}
-    req = svc.devices().deviceUsers().list(
+    kwargs = dict(
         parent="devices/-",
         customer="customers/my_customer",
-        filter="type:mac",
         fields="deviceUsers(name,userEmail),nextPageToken",
     )
+    if type_filter:
+        kwargs["filter"] = f"type:{type_filter}"
+    req = svc.devices().deviceUsers().list(**kwargs)
     while req is not None:
         resp = _execute(req)
         for du in resp.get("deviceUsers", []) or []:
@@ -310,6 +334,139 @@ def fetch_mac_device_users(svc) -> dict[str, list[dict]]:
             })
         req = svc.devices().deviceUsers().list_next(req, resp)
     return by_device
+
+
+def fetch_mac_device_users(svc) -> dict[str, list[dict]]:
+    """Bulk Mac DeviceUsers. Thin wrapper over `fetch_device_users(svc, 'mac')`."""
+    return fetch_device_users(svc, "mac")
+
+
+# Field mask broad enough for the non-Mac listers (mobile + everything-else),
+# which surface posture signals the Mac report doesn't (compromisedState,
+# securityPatchTime, the Android attribute block, ...). `collect_devices` uses
+# it; the Mac path keeps its own narrower mask above.
+DEVICE_LIST_FIELDS = (
+    "devices(name,deviceType,serialNumber,lastSyncTime,model,osVersion,"
+    "manufacturer,brand,compromisedState,encryptionState,securityPatchTime,"
+    "managementState,ownerType,releaseVersion,buildNumber,hostname,imei,meid,"
+    "networkOperator,enabledDeveloperOptions,enabledUsbDebugging,"
+    "androidSpecificAttributes),nextPageToken"
+)
+
+
+def collect_devices(
+    creds: service_account.Credentials,
+    *,
+    device_filter: Callable[[dict], bool],
+    view: str = "USER_ASSIGNED_DEVICES",
+    last_sync_days: int = 30,
+    fields: str = DEVICE_LIST_FIELDS,
+    require_serial: bool = False,
+    user_type_filters: Sequence[str] | None = None,
+    user_email: str | None = None,
+) -> list[dict]:
+    """Generic active-device collector shared by the non-Mac listers.
+
+    Tenant-wide path: lists the whole tenant once (no server-side `type:`
+    filter — the friendly token spellings beyond `mac`/`android`/`ios` are
+    undocumented, so we bucket client-side via `device_filter` for robustness),
+    drops records that haven't synced within `last_sync_days`, dedups to one row
+    per physical device, and attaches user attribution.
+
+    Focused path (`user_email` set): skips the tenant-wide `devices.list`
+    entirely. Runs one server-side `email:<X>` filter on `deviceUsers.list`
+    (falling back to bulk + client filter if the tenant regresses), then a
+    batched `devices.get` on just that user's device set. `device_filter` still
+    buckets the result by `deviceType` client-side — there is no server token
+    for "not mac/android/ios" — so a `--user` lookup returns only the device
+    types this lister owns.
+
+    `device_filter(d) -> bool` selects which `deviceType` records to keep.
+
+    Dedup key is `serialNumber` when present, else the device's own id; the most
+    recently synced record wins, and `userEmails` is the union across every
+    record sharing the key (multi-user devices). When `require_serial` is set,
+    serial-less records are dropped entirely rather than kept under their id.
+
+    `user_type_filters` scopes the bulk DeviceUsers fetch to those `type:`
+    tokens (e.g. `["android", "ios"]`); None fetches every type. Ignored on the
+    focused path. Either way attribution is intersected against the survivor
+    set, so over-fetching only costs bandwidth, never correctness.
+
+    Each survivor dict is returned with two added keys: `userEmails` (list) and
+    `deviceIds` (the merged set of source records' ids).
+    """
+    svc = build(
+        "cloudidentity", "v1",
+        credentials=creds,
+        cache_discovery=False,
+        static_discovery=True,
+    )
+
+    if user_email:
+        # Focused path: email filter server-side, then devices.get the result.
+        users_by_device, _ = fetch_device_users_for_user(svc, user_email)
+        device_names = [f"devices/{dev_id}" for dev_id in users_by_device]
+        if device_names:
+            get_factories: dict[str, Callable[[], object]] = {
+                f"d{i}": (lambda nm=name: svc.devices().get(name=nm))
+                for i, name in enumerate(device_names)
+            }
+            summaries = list(_run_batch(svc, get_factories).values())
+        else:
+            summaries = []
+    else:
+        # Tenant-wide path: list everything, then bulk DeviceUsers attribution.
+        summaries = []
+        req = svc.devices().list(
+            customer="customers/my_customer", view=view, fields=fields,
+        )
+        while req is not None:
+            resp = _execute(req)
+            summaries.extend(resp.get("devices", []))
+            req = svc.devices().list_next(req, resp)
+        if user_type_filters:
+            users_by_device = {}
+            for tf in user_type_filters:
+                for dev_id, dus in fetch_device_users(svc, tf).items():
+                    users_by_device.setdefault(dev_id, []).extend(dus)
+        else:
+            users_by_device = fetch_device_users(svc)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=last_sync_days)
+    key_to_device_ids: dict[str, set[str]] = {}
+    survivors_by_key: dict[str, dict] = {}
+    for d in summaries:
+        if not device_filter(d):
+            continue
+        sync = _parse_sync(d)
+        if sync is None or sync < cutoff:
+            continue
+        serial = (d.get("serialNumber") or "").strip()
+        device_id = _device_id(d.get("name", ""))
+        if require_serial and not serial:
+            continue
+        key = serial or device_id
+        if not key:
+            continue
+        if device_id:
+            key_to_device_ids.setdefault(key, set()).add(device_id)
+        existing = survivors_by_key.get(key)
+        existing_sync = _parse_sync(existing) if existing else None
+        if existing_sync is None or existing_sync < sync:
+            survivors_by_key[key] = d
+
+    for key, d in survivors_by_key.items():
+        emails: dict[str, None] = {}
+        for dev_id in key_to_device_ids.get(key, set()):
+            for u in users_by_device.get(dev_id, []):
+                ue = u.get("userEmail")
+                if ue:
+                    emails[ue] = None
+        d["userEmails"] = list(emails)
+        d["deviceIds"] = sorted(key_to_device_ids.get(key, set()))
+
+    return list(survivors_by_key.values())
 
 
 def extract_browser(full_device: dict) -> str:

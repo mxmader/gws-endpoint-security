@@ -168,6 +168,14 @@ Two companion scripts handle the inverse / user-centric views:
   users with at least one unencrypted Mac, then users with all-encrypted
   Macs.
 
+The same device surface holds non-Mac platforms, handled by two sibling
+listers documented in [Beyond Macs](#beyond-macs-mobile-and-everything-else)
+below:
+
+- **`list_mobile_devices.py`** — Android & iOS, sorted by integrity posture.
+- **`list_other_devices.py`** — Windows / Linux / ChromeOS / Google Sync,
+  sorted by disk-encryption risk like the Mac report.
+
 ## Signal-mix classifier (what shows up in the `SIGNALS` column)
 
 | Label | Has `encryptionState` | Has `serialNumber` | Has `hostname` | Likely agent(s) |
@@ -225,3 +233,154 @@ Reading this:
 - **Without a join key, deduplicating by physical machine is not reliable.**
   Treat each row as "what this particular reporting agent knows about a Mac
   associated with this user."
+
+# Beyond Macs: mobile and everything else
+
+The `deviceType` enum on a Device record takes one of: `ANDROID`, `IOS`,
+`GOOGLE_SYNC`, `WINDOWS`, `MAC_OS`, `LINUX`, `CHROME_OS`, or the placeholder
+`DEVICE_TYPE_UNSPECIFIED`. `list_mac_devices.py` keeps only `MAC_OS`; the two
+sibling listers split the rest:
+
+- `list_mobile_devices.py` → `ANDROID` + `IOS`
+- `list_other_devices.py` → everything that is **not** `MAC_OS`, `ANDROID`,
+  or `IOS` (i.e. `WINDOWS`, `LINUX`, `CHROME_OS`, `GOOGLE_SYNC`,
+  `DEVICE_TYPE_UNSPECIFIED`).
+
+Both reuse the same plumbing as the Mac script — the keyless DWD auth, the
+active-sync-window filter (default 30 days), dedup to one row per physical
+device (by `serialNumber` when present, else the device id), and the bulk
+`deviceUsers.list` attribution pass. The difference is **which signals matter**,
+and that changes the sort.
+
+> Like the rest of this file, the field sets below are observations against the
+> illustrative tenant, not a Google specification. Mobile reporting in
+> particular varies sharply with the management tier the OU is on.
+
+## Mobile (Android & iOS)
+
+Where Mac risk is "is FileVault on," mobile risk is **device integrity** — is
+the device rooted/jailbroken, sideloading, or otherwise tampered with.
+Encryption is a near-constant on this surface (iOS is always hardware-encrypted;
+Android has been file-based-encrypted by default since Android 10), so it earns
+a column but does **not** drive the sort.
+
+### How mobile devices register
+
+- **Google endpoint management (basic vs. advanced).** Both Android and iOS
+  reach Cloud Identity through Google's mobile management — the Google Device
+  Policy app on Android, an APNs/MDM profile on iOS. **Basic** management
+  yields a thin record (model, OS version, last sync, `managementState`).
+  **Advanced** management unlocks the rich attribute set, and on Android
+  specifically the `androidSpecificAttributes` block (Play Integrity /
+  SafetyNet verdicts, verified boot, unknown-sources, harmful-apps).
+- **Google Sync (ActiveSync).** Mail-only clients register as
+  `deviceType: GOOGLE_SYNC`, **not** `IOS`/`ANDROID` — so an iPhone that only
+  talks to Gmail over ActiveSync lands in `list_other_devices.py`, not the
+  mobile report. (See the next section.)
+
+### What the integrity signals are
+
+`list_mobile_devices.py` collapses these into a `RISK_FLAGS` column and sorts
+**compromised → other flags → clean**:
+
+| Flag | Source field | Meaning |
+|---|---|---|
+| `compromised` | `compromisedState == COMPROMISED` | Rooted (Android) or jailbroken (iOS). Top of the sort. |
+| `harmful-apps` | `androidSpecificAttributes.hasPotentiallyHarmfulApps` | Play Protect flagged installed app(s). |
+| `cts-fail` | `androidSpecificAttributes.ctsProfileMatch == false` | Failed Play Integrity / SafetyNet CTS profile match. |
+| `no-verified-boot` | `androidSpecificAttributes.verifiedBoot == false` | Boot chain not verified. |
+| `verify-apps-off` | `androidSpecificAttributes.verifyAppsEnabled == false` | Play Protect scanning disabled. |
+| `unknown-sources` | `androidSpecificAttributes.enabledUnknownSources` | Sideloading from outside Play allowed. |
+| `dev-options` | `enabledDeveloperOptions` | Developer options enabled. |
+| `usb-debug` | `enabledUsbDebugging` | ADB / USB debugging enabled. |
+
+Android-only fields (`ctsProfileMatch`, `verifiedBoot`, `verifyAppsEnabled`,
+`enabledUsbDebugging`, …) simply never appear on iOS records, so an iOS device
+is only ever flagged via `compromised`. We treat a boolean as a problem only
+when the API explicitly says so (`is False` / truthy) — a *missing* field is
+never a flag.
+
+### Field set by platform
+
+- **Android, advanced management:** `serialNumber`, `model`, `brand`,
+  `manufacturer`, `osVersion`, `releaseVersion`, `buildNumber`,
+  `securityPatchTime`, `imei`/`meid`, `networkOperator`, `ownerType`,
+  `managementState`, `compromisedState`, `encryptionState`, the developer/USB
+  booleans, and the full `androidSpecificAttributes` block.
+- **iOS, MDM-managed:** `serialNumber` (supervised/managed only — BYOD often
+  omits it), `model`, `osVersion`, `imei`/`meid`, `ownerType`,
+  `managementState`, `compromisedState`, `encryptionState`. No
+  `androidSpecificAttributes`, no developer/USB booleans.
+- **Either, basic management:** often just `model`, `osVersion`,
+  `lastSyncTime`, `managementState`.
+
+Because BYOD iOS commonly omits `serialNumber`, the mobile lister does **not**
+require a serial by default (dedup falls back to the device id). Pass
+`--require-serial` to drop serial-less records.
+
+### Sample output (default sort)
+
+Compromised first, then other risk flags, then clean.
+
+```
+USER               PLATFORM  MODEL       OS_VERSION  COMPROMISED   ENCRYPTION  RISK_FLAGS                  OWNER    MGMT      SERIAL         LAST_SYNC
+-----------------  --------  ----------  ----------  ------------  ----------  --------------------------  -------  --------  -------------  ------------------------
+bob@example.com    Android   Pixel 6     14          COMPROMISED   ENCRYPTED   compromised, unknown-sources COMPANY  APPROVED  C02ZZZZZZZZZ3  2026-06-03T09:11:02.000Z
+carol@example.com  Android   Pixel 7     15          clean         ENCRYPTED   usb-debug, dev-options       BYOD     APPROVED  C02ZZZZZZZZZ4  2026-06-03T22:40:18.000Z
+alice@example.com  iOS       iPhone15,2  18.5        clean         ENCRYPTED   -                            BYOD     APPROVED  -              2026-06-04T07:02:55.000Z
+```
+
+Reading this: **bob's** rooted Pixel that also allows sideloading is the top
+action item; **carol's** Pixel is not compromised but has ADB and developer
+options on (a posture concern on a BYOD device); **alice's** iPhone is clean and
+reports no serial (expected for BYOD iOS) — it's keyed by device id.
+
+## Everything else (Windows, Linux, ChromeOS, Google Sync)
+
+`list_other_devices.py` is the catch-all. These are mostly **laptops and
+desktops**, so disk encryption is the headline risk again and the script sorts
+exactly like the Mac report: encryption-undetermined first, then
+`NOT_ENCRYPTED`, then `ENCRYPTED` — with `deviceType` as the secondary grouping
+so an unencrypted Windows box never hides behind a page of encrypted
+Chromebooks.
+
+### How these register
+
+- **Windows / Linux** behave like Macs: **Endpoint Verification** (the Chrome
+  extension, optionally plus the native helper) is the channel. The same
+  signal-mix rules apply — the browser-only path reports `encryptionState`
+  (BitLocker / dm-crypt-LUKS) but no serial; the native helper adds
+  `serialNumber` and `hostname`. So a Windows row can be `chrome only`,
+  `hardware only`, or `chrome + hardware` for the same reasons a Mac row can.
+- **ChromeOS** (`deviceType: CHROME_OS`) is primarily managed through the Admin
+  SDK `chromeosdevices` API, not Cloud Identity; what surfaces here tends to be
+  a thin record. For the authoritative ChromeOS inventory, that other API is
+  the right source.
+- **Google Sync** (`deviceType: GOOGLE_SYNC`) is an ActiveSync mail client —
+  minimal fields, no posture signals. Present so the catch-all is genuinely
+  exhaustive; expect mostly empty columns.
+
+### Field set
+
+The encryption-bearing fields mirror the Mac surface (`encryptionState`,
+`serialNumber`, `hostname`, `model`, `osVersion`, `manufacturer`,
+`ownerType`, `managementState`). `compromisedState` and the Android block are
+not populated for these types.
+
+### Sample output (default sort)
+
+Encryption-undetermined and `NOT_ENCRYPTED` rows first; encrypted rows follow.
+
+```
+USER             TYPE      MODEL            OS_VERSION  ENCRYPTION     HOSTNAME           OWNER    MGMT      SERIAL         LAST_SYNC
+---------------  --------  ---------------  ----------  -------------  -----------------  -------  --------  -------------  ------------------------
+dave@example.com Windows   Latitude 7440    11          NOT_ENCRYPTED  dave-win.local     COMPANY  APPROVED  C02ZZZZZZZZZ5  2026-06-02T14:05:00.000Z
+eve@example.com  Linux     ThinkPad X1      -           -              -                  BYOD     APPROVED  -              2026-06-03T08:30:00.000Z
+frank@example.com ChromeOS Chromebook       125         ENCRYPTED      -                  COMPANY  APPROVED  C02ZZZZZZZZZ6  2026-06-04T06:15:00.000Z
+```
+
+Reading this: **dave's** Windows laptop has BitLocker off (`NOT_ENCRYPTED`) —
+the top action item; **eve's** Linux box reports only browser-level signals
+(EV extension, no native helper), so encryption is undetermined and there's no
+serial; **frank's** Chromebook is encrypted (ChromeOS storage is encrypted by
+default) and clean.

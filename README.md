@@ -9,6 +9,16 @@ with domain-wide delegation:
   Devices API. Rows sorted with non-`ENCRYPTED` Macs first. Tune the window
   via `--last-sync-days N`; add the BROWSER column (Chrome version, one
   extra `devices.get` per device) via `--include-browser`.
+- [`list_mobile_devices.py`](./list_mobile_devices.py) — active Android & iOS
+  devices (synced in the trailing 30 days, deduped) with their integrity
+  posture. Rows sorted with **compromised** (rooted/jailbroken) devices first,
+  then devices carrying any other risk flag (USB debugging, developer options,
+  sideloading, failed Play Integrity, potentially-harmful apps), then clean.
+  Same `--last-sync-days N` / `--view` / `--require-serial` knobs.
+- [`list_other_devices.py`](./list_other_devices.py) — everything that is
+  **not** Mac, Android, or iOS: Windows, Linux, ChromeOS, Google Sync, etc.
+  Sorted by disk-encryption risk (undetermined first, then NOT_ENCRYPTED, then
+  ENCRYPTED), grouped by device type. Same knobs.
 - [`list_users_with_macs.py`](./list_users_with_macs.py) — every active
   Workspace user, correlated against the Mac survivor set. Rows sorted to
   surface users with **no Mac**, then users with at least one unencrypted
@@ -85,6 +95,7 @@ https://www.googleapis.com/auth/admin.directory.user.readonly
 What each scope powers:
 
 - `cloud-identity.devices.readonly` — `list_mac_devices.py`,
+  `list_mobile_devices.py`, `list_other_devices.py`,
   `list_users_with_macs.py`, `list_caa_events.py` (all use device list /
   get; the Mac correlation in CAA events is a `deviceId` join against a
   pre-built catalog).
@@ -105,6 +116,8 @@ Read-Only" custom admin role assigned to a service-style account.
 | Script | Required admin-role privilege |
 |---|---|
 | `list_mac_devices.py` | Services → **Mobile Device Management** (Read) |
+| `list_mobile_devices.py` | Services → **Mobile Device Management** (Read) |
+| `list_other_devices.py` | Services → **Mobile Device Management** (Read) |
 | `list_users_with_macs.py` | Services → **Mobile Device Management** (Read) + Admin API Privileges → **Users** (Read) |
 | `prune_devices.py` | Services → **Mobile Device Management** (full — *not* the Read-only sub-privilege) |
 | `list_app_authorizations.py` | Admin API Privileges → **Reports** (Read) |
@@ -124,6 +137,8 @@ export SA_EMAIL=endpoint-security-reader@<PROJECT>.iam.gserviceaccount.com
 export WORKSPACE_ADMIN_EMAIL=security-reader@yourdomain.com  # see privilege table above
 
 uv run python list_mac_devices.py                   # active Macs + encryption
+uv run python list_mobile_devices.py                # active Android/iOS + integrity
+uv run python list_other_devices.py                 # Windows/Linux/ChromeOS/etc.
 uv run python list_users_with_macs.py               # users -> Macs correlation
 uv run python list_app_authorizations.py --days 30  # OAuth app grants, last 30 days
 uv run python list_signins.py --days 7              # sign-in events with IP + method
@@ -131,7 +146,7 @@ uv run python prune_devices.py                      # DRY RUN of prune candidate
 uv run python prune_devices.py --execute            # actually delete
 ```
 
-All five scripts accept `--format {plain,json,csv}` and `--output PATH`
+All scripts accept `--format {plain,json,csv}` and `--output PATH`
 for non-interactive consumption. See `--help` on each for the full flag set.
 
 ## How auth works (no key file)
