@@ -93,6 +93,20 @@ identifiers available. If you need browser attribution for a specific Mac,
 look at the EV-equipped Device records in `list_mac_devices.py` instead;
 there is no per-sign-in browser data in Workspace audit logs.
 
+**IP ownership is not a Google field.** The `login` activity gives a bare
+`ipAddress` plus a coarse geographic `networkInfo` block (`subdivisionCode` /
+`regionCode`) — it carries **no ISP, ASN, or registrant**. The `OWNER` column
+in `list_signins.py` is filled by a separate module,
+[`ip_attribution.py`](../ip_attribution.py), which resolves each IP to its
+**RDAP-registered network owner** (the org that holds the block at its RIR —
+ARIN / RIPE / APNIC / LACNIC / AFRINIC) via the IANA RDAP bootstrap. Owners
+are cached on disk keyed by the registered CIDR (`ip_attribution_cache.json`,
+git-ignored — it holds real IPs); since registration data is very
+slow-changing, the cache stays valid for months and only the first run on a
+cold cache makes network calls. Enrichment is on by default;
+`--no-ip-attribution` skips it. Private/reserved IPs render as
+`private/reserved` and never hit the network.
+
 ### Authentication factors (`login_challenge_method`, same `login` log)
 
 The *factor* a user actually authenticated with — passkey, FIDO2 security

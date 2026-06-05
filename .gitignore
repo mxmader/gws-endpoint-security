@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 !uv.lock
+
+# RDAP IP-attribution cache (holds real IPs/CIDRs — never commit).
+ip_attribution_cache.json

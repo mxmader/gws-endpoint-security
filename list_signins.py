@@ -5,6 +5,11 @@ Surfaces who signed in (or tried to), when, from which IP, and via which
 method (`google_password`, `saml`, `oauth`, `unknown`), plus a `suspicious`
 flag Google sets on risky sign-ins.
 
+Each IP is annotated with its registered network owner (the `OWNER` column),
+resolved via RDAP and cached locally — see `ip_attribution.py`. This is on by
+default; `--no-ip-attribution` disables it (no network calls). The first run
+on a cold cache is slower while owners are looked up; later runs hit the cache.
+
 **What this script does NOT include**: the browser user-agent string.
 Login events in the Reports API don't carry a `user_agent` parameter — IP
 is the closest "where from" identifier on this surface. If you need browser
@@ -26,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 
 from googleapiclient.discovery import build
 
+from ip_attribution import attribute_ips
 from list_mac_devices import _format_plain, build_credentials, write_formatted
 
 SCOPES = ["https://www.googleapis.com/auth/admin.reports.audit.readonly"]
@@ -159,7 +165,9 @@ def flatten(
     return rows
 
 
-HEADERS = ("USER", "TIME", "EVENT", "LOGIN_TYPE", "SUSPICIOUS", "IP", "LOCATION")
+HEADERS = (
+    "USER", "TIME", "EVENT", "LOGIN_TYPE", "SUSPICIOUS", "IP", "OWNER", "LOCATION"
+)
 
 
 def _table_columns(rows: list[dict]) -> list[tuple]:
@@ -173,6 +181,7 @@ def _table_columns(rows: list[dict]) -> list[tuple]:
             r["login_type"] or "-",
             "true" if r["suspicious"] else "-",
             r["ip"] or "-",
+            r.get("ip_owner") or "-",
             r["location"] or "-",
         )
         for r in rows
@@ -183,10 +192,12 @@ def render_table(rows: list[dict]) -> str:
     def shrink(s: str, limit: int) -> str:
         return s if len(s) <= limit else s[: limit - 1] + "…"
 
-    # Trim IPv6 (col 5) at IPv6 max width for the plain table; full value
-    # preserved in JSON / CSV output.
+    # Trim IPv6 (the IP column) at IPv6 max width for the plain table; full
+    # value preserved in JSON / CSV output. OWNER passes through untrimmed.
     full = _table_columns(rows)
-    trimmed = [(r[0], r[1], r[2], r[3], r[4], shrink(r[5], 39), r[6]) for r in full]
+    trimmed = [
+        (r[0], r[1], r[2], r[3], r[4], shrink(r[5], 39), r[6], r[7]) for r in full
+    ]
     return _format_plain(HEADERS, trimmed)
 
 
@@ -227,6 +238,17 @@ def main() -> int:
         "--include-challenges", action="store_true",
         help="Include login_challenge / login_verification / other non-sign-in events.",
     )
+    p.add_argument(
+        "--no-ip-attribution", action="store_true",
+        help="Skip OWNER enrichment (no RDAP lookups). By default each IP is "
+             "annotated with its registered network owner via RDAP, cached "
+             "locally; the first run on a fresh cache is slower.",
+    )
+    p.add_argument(
+        "--refresh-ip-attribution", action="store_true",
+        help="Bypass the cached owner for IPs seen this run and refetch them "
+             "from RDAP (registration data is slow-changing, so rarely needed).",
+    )
     args = p.parse_args()
 
     try:
@@ -250,6 +272,22 @@ def main() -> int:
         failures_only=args.failures_only,
     )
     rows.sort(key=lambda r: r["time"], reverse=True)
+
+    # Annotate each row with the registered network owner of its source IP.
+    # On by default; --no-ip-attribution skips all RDAP/network work.
+    if args.no_ip_attribution:
+        for r in rows:
+            r["ip_owner"] = ""
+            r["ip_attribution"] = None
+    else:
+        attribution = attribute_ips(
+            (r["ip"] for r in rows),
+            refresh=args.refresh_ip_attribution,
+        )
+        for r in rows:
+            info = attribution.get(r["ip"]) if r["ip"] else None
+            r["ip_owner"] = (info or {}).get("owner", "")
+            r["ip_attribution"] = info
 
     plain_text = render_table(rows)
     if args.format == "plain" and not args.output:

@@ -79,6 +79,20 @@ def decode_model(raw: str | None) -> str:
         return hit
     return _MAC_MODELS_NOCOMMA.get(raw.replace(",", ""), "")
 
+
+def model_cell(d: dict) -> str:
+    """MODEL-column text: the decoded name, or the raw identifier flagged with
+    a trailing "*" when it isn't in mac_models.json (a hint to add it). The
+    "Mac OS" stale-registration placeholder is left unflagged — it's a known
+    non-identifier, not a catalog gap."""
+    decoded = d.get("modelName")
+    if decoded:
+        return decoded
+    raw = d.get("model")
+    if not raw:
+        return "-"
+    return raw if raw == "Mac OS" else f"{raw}*"
+
 # Bounded retry for transient errors (429 RATE_LIMIT_EXCEEDED, 5xx).
 _MAX_RETRIES = 4
 _BACKOFF_BASE_SEC = 2.0
@@ -779,9 +793,9 @@ def _table_columns(devices: list[dict], with_clients: bool, include_browser: boo
         base = base + (
             classify_signals(d),
             d.get("serialNumber", "-"),
-            # Prefer the decoded narrative when we have it; fall back to the
-            # raw Apple model identifier otherwise.
-            d.get("modelName") or d.get("model") or "-",
+            # Decoded narrative when recognized; otherwise the raw Apple model
+            # identifier flagged with "*" (see model_cell).
+            model_cell(d),
             d.get("osVersion") or "-",
             d.get("hostname") or "-",
             d.get("assetTag", "-"),

@@ -34,7 +34,10 @@ with domain-wide delegation:
   Admin SDK Reports `token` activity log.
 - [`list_signins.py`](./list_signins.py) — per-user sign-in events with IP,
   login method, and suspicious-flag, from the Admin SDK Reports `login`
-  activity log. (Note: browser user-agent is **not** on this surface.)
+  activity log. The IP is annotated with its registered network `OWNER`
+  (RDAP-resolved, locally cached — see [`ip_attribution.py`](./ip_attribution.py));
+  pass `--no-ip-attribution` to skip the lookups. (Note: browser user-agent is
+  **not** on this surface.)
 - [`list_auth_factors.py`](./list_auth_factors.py) — per-user **authentication
   factor** rollup from the same `login` log: which factors each user actually
   used (passkey, FIDO2 security key, password, TOTP, Google prompt, backup
@@ -150,7 +153,7 @@ uv run python list_mobile_devices.py                # active Android/iOS + integ
 uv run python list_other_devices.py                 # Windows/Linux/ChromeOS/etc.
 uv run python list_users_with_macs.py               # users -> Macs correlation
 uv run python list_app_authorizations.py --days 30  # OAuth app grants, last 30 days
-uv run python list_signins.py --days 7              # sign-in events with IP + method
+uv run python list_signins.py --days 7              # sign-in events with IP + owner + method
 uv run python list_auth_factors.py --days 30        # per-user auth factors + 2SV posture
 uv run python prune_devices.py                      # DRY RUN of prune candidates
 uv run python prune_devices.py --execute            # actually delete
