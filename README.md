@@ -57,9 +57,12 @@ with domain-wide delegation:
   companion to the above: for one `--user` over `--days`, one row per unique
   **(device id, IP)** pair showing the **most recent** CAA event for it
   (regardless of outcome) — TIME, LOCAL_TIME (`--tz` IANA zone or system local),
-  DEVICE_ID, MODEL (Mac + iOS/Android), DEVICE_STATE, IP, IP_OWNER, LOCATION,
-  grouped by device. A deduped "travel trace" of where each of a user's devices
-  has recently appeared at the access boundary.
+  DEVICE_ID, MODEL (Mac + iOS/Android), DEVICE_STATE, EVENT, IP, IP_OWNER,
+  LOCATION, grouped by device. A deduped "travel trace" of where each of a
+  user's devices has recently appeared at the access boundary. LOCATION uses
+  Google's own region, falling back to an offline MaxMind GeoLite2-City lookup
+  for the US state when Google supplies only a country (marked `~`; optional —
+  see setup below).
 
 See [docs/google_device_data_sources.md](./docs/google_device_data_sources.md)
 for what signals the device API actually exposes and how to interpret them.
@@ -173,6 +176,30 @@ uv run python prune_devices.py --execute            # actually delete
 
 All scripts accept `--format {plain,json,csv}` and `--output PATH`
 for non-interactive consumption. See `--help` on each for the full flag set.
+
+### Optional: US-state geolocation for `list_caa_device_summary.py`
+
+Google's CAA events often carry only a country for an IP. To fill in the US
+state, `list_caa_device_summary.py` does an **offline** lookup against a MaxMind
+GeoLite2-City database — no IPs leave the machine. It's optional: without the DB
+the `LOCATION` column simply stays country-only.
+
+To enable it, get the free **`GeoLite2-City.mmdb`** (a free MaxMind account
+provides a license key to download it — the key is only needed to *download* the
+file; the **Country** edition won't work, it has no state). It's auto-discovered
+in the usual `geoipupdate` / Homebrew locations — `/opt/homebrew/var/GeoIP`,
+`/usr/local/var/GeoIP`, `/usr/share/GeoIP` — or next to the scripts, so a
+`brew install geoipupdate && geoipupdate` setup needs no further config. To use
+a custom path, set an env var:
+
+```bash
+export GEOIP_CITY_DB=/path/to/GeoLite2-City.mmdb   # explicit file, or
+export GEOIP_DIR=/path/to/geoip-dir                # a directory to search
+```
+
+Geolocation is an estimate (least reliable for carrier/business IPs), so
+geolocated rows are marked with a leading `~` and should be read as directional,
+not authoritative. The `.mmdb` is git-ignored (licensed redistribution).
 
 ## How auth works (no key file)
 

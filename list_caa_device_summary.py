@@ -9,13 +9,18 @@ distinct source IPs) with repeated same-IP events collapsed to a single line.
 
 Scoped to one user (`--user`, required) over `--days`. Rows are grouped by
 device, newest sighting first within each. Columns:
-TIME, LOCAL_TIME, DEVICE_ID, MODEL, DEVICE_STATE, IP, IP_OWNER, LOCATION.
+TIME, LOCAL_TIME, DEVICE_ID, MODEL, DEVICE_STATE, EVENT, IP, IP_OWNER, LOCATION.
 
 TIME is the raw UTC stamp; LOCAL_TIME renders it in `--tz` (an IANA zone, e.g.
-'America/Denver') or the system local zone when omitted. IP / LOCATION come off
-the CAA event's native `networkInfo` envelope; MODEL is resolved from the Cloud
-Identity device record (Macs *and* iOS/Android); IP_OWNER is RDAP-resolved and
-locally cached (`--no-ip-attribution` to skip).
+'America/Denver') or the system local zone when omitted. EVENT is the CAA event
+(e.g. "Access Denied"). IP comes off the event's native `networkInfo` envelope;
+MODEL is resolved from the Cloud Identity device record (Macs *and* iOS/Android);
+IP_OWNER is RDAP-resolved and locally cached (`--no-ip-attribution` to skip).
+
+LOCATION prefers Google's own subdivision when present; when Google gives only a
+country, it falls back to an offline MaxMind GeoLite2-City lookup for the state
+(see `ip_geolocation.py`), marked with a leading "~" to flag it as an estimate.
+Without the GeoLite2 DB installed, LOCATION stays country-only — nothing breaks.
 
 Auth: keyless. Needs `admin.reports.audit.readonly` (CAA events) +
 `cloud-identity.devices.readonly` (device records) in the DWD entry.
@@ -29,6 +34,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ip_attribution import attribute_ips
+from ip_geolocation import geolocate, render_geo
 from list_caa_events import _param, build_device_catalog, fetch_caa_activity
 from list_mac_devices import (
     _format_plain,
@@ -42,6 +48,17 @@ SCOPES = [
     "https://www.googleapis.com/auth/admin.reports.audit.readonly",
     "https://www.googleapis.com/auth/cloud-identity.devices.readonly",
 ]
+
+# Friendly labels for the raw context_aware_access event names; unknown names
+# pass through as-is (add a mapping when a new one shows up).
+_EVENT_LABELS = {
+    "ACCESS_DENY_EVENT": "Access Denied",
+    "ACCESS_DENY_INTERNAL_ERROR_EVENT": "Access Denied (internal error)",
+}
+
+
+def _event_label(name: str) -> str:
+    return _EVENT_LABELS.get(name, name)
 
 
 def latest_per_device_ip(activities) -> dict[tuple, dict]:
@@ -69,10 +86,23 @@ def latest_per_device_ip(activities) -> dict[tuple, dict]:
                     "time": time_str,
                     "device_id": device_id,
                     "device_state": _param(ev, "CAA_DEVICE_STATE"),
+                    "event": _event_label(ev.get("name") or ""),
                     "ip": ip,
-                    "location": render_location(network_info),
+                    "network_info": network_info,
                 }
     return latest
+
+
+def resolve_location(network_info: dict, ip: str) -> str:
+    """LOCATION cell. Prefers Google's own subdivision when present; otherwise
+    falls back to offline MaxMind geolocation of the IP for the state, marked
+    with a leading "~" to flag it as an estimate (vs Google-supplied)."""
+    loc = render_location(network_info)
+    if ip and not (network_info or {}).get("subdivisionCode"):
+        geo = geolocate(ip)
+        if geo.get("subdivision"):
+            return "~" + render_geo(geo)
+    return loc
 
 
 def to_local(ts: str, tz: ZoneInfo | None) -> str:
@@ -91,7 +121,7 @@ def to_local(ts: str, tz: ZoneInfo | None) -> str:
 
 
 HEADERS = (
-    "TIME", "LOCAL_TIME", "DEVICE_ID", "MODEL", "DEVICE_STATE",
+    "TIME", "LOCAL_TIME", "DEVICE_ID", "MODEL", "DEVICE_STATE", "EVENT",
     "IP", "IP_OWNER", "LOCATION",
 )
 
@@ -104,6 +134,7 @@ def _table_columns(rows: list[dict]) -> list[tuple]:
             r.get("device_id") or "-",
             r.get("model") or "-",
             r.get("device_state") or "-",
+            r.get("event") or "-",
             r.get("ip") or "-",
             r.get("ip_owner") or "-",
             r.get("location") or "-",
@@ -170,6 +201,7 @@ def main() -> int:
     rows = list(latest_per_device_ip(activities).values())
     for r in rows:
         r["local_time"] = to_local(r["time"], tz)
+        r["location"] = resolve_location(r.get("network_info") or {}, r.get("ip"))
 
     # Resolve each device id to a model via the Cloud Identity catalog
     # (user-scoped). type_filter=None so iOS/Android records are included too,

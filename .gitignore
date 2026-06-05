@@ -5,3 +5,9 @@ __pycache__/
 
 # RDAP IP-attribution cache (holds real IPs/CIDRs — never commit).
 ip_attribution_cache.json
+
+# MaxMind GeoLite2 database (licensed redistribution-restricted; user-supplied).
+*.mmdb
+
+# MaxMind GeoIP lite updater conf
+GeoIP.conf

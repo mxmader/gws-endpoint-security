@@ -8,6 +8,7 @@ dependencies = [
     "google-api-python-client>=2.120",
     "requests>=2.31",
     "pycountry>=23.12",
+    "maxminddb>=2.5",
 ]
 
 [tool.uv]

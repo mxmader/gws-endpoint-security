@@ -1,6 +1,9 @@
+#!/usr/bin/env python3
+
 import os, json, sys
 from list_mac_devices import build_credentials
 from list_caa_events import fetch_caa_activity, SCOPES
+
 creds = build_credentials(os.environ['SA_EMAIL'], os.environ['WORKSPACE_ADMIN_EMAIL'], SCOPES)
 seen = set()
 user = sys.argv[1]
