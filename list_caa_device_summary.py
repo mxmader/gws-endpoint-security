@@ -18,9 +18,12 @@ MODEL is resolved from the Cloud Identity device record (Macs *and* iOS/Android)
 IP_OWNER is RDAP-resolved and locally cached (`--no-ip-attribution` to skip).
 
 LOCATION prefers Google's own subdivision when present; when Google gives only a
-country, it falls back to an offline MaxMind GeoLite2-City lookup for the state
-(see `ip_geolocation.py`), marked with a leading "~" to flag it as an estimate.
-Without the GeoLite2 DB installed, LOCATION stays country-only — nothing breaks.
+country it falls back to offline MaxMind GeoLite2-City (see `ip_geolocation.py`):
+"~State, Country" when MaxMind can name a state, else "*Country (Time/Zone)" when
+it can't name a state but has a precise-enough fix to trust the time zone (a
+coarser hint; the country-centroid placeholder is excluded). "~"/"*" flag the
+MaxMind estimate vs Google data. Without the GeoLite2 DB, LOCATION stays
+country-only — nothing breaks.
 
 Auth: keyless. Needs `admin.reports.audit.readonly` (CAA events) +
 `cloud-identity.devices.readonly` (device records) in the DWD entry.
@@ -93,15 +96,31 @@ def latest_per_device_ip(activities) -> dict[tuple, dict]:
     return latest
 
 
+# Above this MaxMind accuracy_radius (km), the location is too coarse to trust
+# even for a time zone — notably the ~1000 km country-centroid placeholder
+# returned when MaxMind can only resolve an IP to its country.
+_TZ_MAX_RADIUS_KM = 500
+
+
 def resolve_location(network_info: dict, ip: str) -> str:
-    """LOCATION cell. Prefers Google's own subdivision when present; otherwise
-    falls back to offline MaxMind geolocation of the IP for the state, marked
-    with a leading "~" to flag it as an estimate (vs Google-supplied)."""
+    """LOCATION cell, best signal first:
+      - Google's own subdivision when present (no marker);
+      - "~State, Country" from offline MaxMind when it can name a state;
+      - "*Country (Time/Zone)" when MaxMind can't name a state but has a
+        precise-enough fix to trust its time zone (a coarser hint);
+      - country-only otherwise.
+    The "~"/"*" markers flag MaxMind estimates vs Google-supplied data.
+    """
     loc = render_location(network_info)
     if ip and not (network_info or {}).get("subdivisionCode"):
         geo = geolocate(ip)
         if geo.get("subdivision"):
             return "~" + render_geo(geo)
+        tz = geo.get("time_zone")
+        radius = geo.get("accuracy_radius")
+        if tz and radius is not None and radius <= _TZ_MAX_RADIUS_KM:
+            country = geo.get("country") or loc
+            return f"*{country} ({tz})"
     return loc
 
 

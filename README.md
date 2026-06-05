@@ -198,8 +198,12 @@ export GEOIP_DIR=/path/to/geoip-dir                # a directory to search
 ```
 
 Geolocation is an estimate (least reliable for carrier/business IPs), so
-geolocated rows are marked with a leading `~` and should be read as directional,
-not authoritative. The `.mmdb` is git-ignored (licensed redistribution).
+geolocated rows are marked and should be read as directional, not authoritative:
+`~State, Country` when MaxMind can name a state, or `*Country (Time/Zone)` as a
+coarser fallback when it can't name a state but has a precise-enough fix to
+trust the time zone. IPs MaxMind can only place to the country (the centroid
+placeholder, e.g. many cellular ranges) stay country-only. The `.mmdb` is
+git-ignored (licensed redistribution).
 
 ## How auth works (no key file)
 

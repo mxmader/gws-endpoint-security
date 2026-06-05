@@ -97,6 +97,7 @@ def geolocate(ip: str) -> dict:
     subs = rec.get("subdivisions") or []
     sub = subs[0] if subs else {}
     city = rec.get("city") or {}
+    loc = rec.get("location") or {}
     cc = country.get("iso_code") or ""
     sub_iso = sub.get("iso_code") or ""
     return {
@@ -105,6 +106,11 @@ def geolocate(ip: str) -> dict:
         "subdivision_code": f"{cc}-{sub_iso}" if cc and sub_iso else sub_iso,
         "subdivision": (sub.get("names") or {}).get("en", ""),
         "city": (city.get("names") or {}).get("en", ""),
+        # When MaxMind can't name a state it still reports a time zone; its
+        # accuracy_radius (km) says how much to trust the underlying location —
+        # a huge radius is the country-centroid placeholder ("only knows US").
+        "time_zone": loc.get("time_zone", ""),
+        "accuracy_radius": loc.get("accuracy_radius"),
     }
 
 
