@@ -56,9 +56,10 @@ with domain-wide delegation:
 - [`list_caa_device_summary.py`](./list_caa_device_summary.py) — concise
   companion to the above: for one `--user` over `--days`, one row per unique
   **(device id, IP)** pair showing the **most recent** CAA event for it
-  (regardless of outcome) — TIME, DEVICE_ID, MODEL, DEVICE_STATE, IP, IP_OWNER,
-  LOCATION, grouped by device. A deduped "travel trace" of where each of a
-  user's devices has recently appeared at the access boundary.
+  (regardless of outcome) — TIME, LOCAL_TIME (`--tz` IANA zone or system local),
+  DEVICE_ID, MODEL (Mac + iOS/Android), DEVICE_STATE, IP, IP_OWNER, LOCATION,
+  grouped by device. A deduped "travel trace" of where each of a user's devices
+  has recently appeared at the access boundary.
 
 See [docs/google_device_data_sources.md](./docs/google_device_data_sources.md)
 for what signals the device API actually exposes and how to interpret them.

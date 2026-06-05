@@ -9,10 +9,12 @@ distinct source IPs) with repeated same-IP events collapsed to a single line.
 
 Scoped to one user (`--user`, required) over `--days`. Rows are grouped by
 device, newest sighting first within each. Columns:
-TIME, DEVICE_ID, MODEL, DEVICE_STATE, IP, IP_OWNER, LOCATION.
+TIME, LOCAL_TIME, DEVICE_ID, MODEL, DEVICE_STATE, IP, IP_OWNER, LOCATION.
 
-IP / LOCATION come off the CAA event's native `networkInfo` envelope; MODEL is
-resolved from the Cloud Identity device record; IP_OWNER is RDAP-resolved and
+TIME is the raw UTC stamp; LOCAL_TIME renders it in `--tz` (an IANA zone, e.g.
+'America/Denver') or the system local zone when omitted. IP / LOCATION come off
+the CAA event's native `networkInfo` envelope; MODEL is resolved from the Cloud
+Identity device record (Macs *and* iOS/Android); IP_OWNER is RDAP-resolved and
 locally cached (`--no-ip-attribution` to skip).
 
 Auth: keyless. Needs `admin.reports.audit.readonly` (CAA events) +
@@ -24,6 +26,7 @@ import argparse
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ip_attribution import attribute_ips
 from list_caa_events import _param, build_device_catalog, fetch_caa_activity
@@ -72,8 +75,24 @@ def latest_per_device_ip(activities) -> dict[tuple, dict]:
     return latest
 
 
+def to_local(ts: str, tz: ZoneInfo | None) -> str:
+    """RFC 3339 UTC timestamp -> 'YYYY-MM-DD HH:MM:SS TZ' in `tz`, or the
+    system local zone when `tz` is None. Returns the raw string if unparseable.
+    """
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return ts
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
 HEADERS = (
-    "TIME", "DEVICE_ID", "MODEL", "DEVICE_STATE", "IP", "IP_OWNER", "LOCATION",
+    "TIME", "LOCAL_TIME", "DEVICE_ID", "MODEL", "DEVICE_STATE",
+    "IP", "IP_OWNER", "LOCATION",
 )
 
 
@@ -81,6 +100,7 @@ def _table_columns(rows: list[dict]) -> list[tuple]:
     return [
         (
             r.get("time") or "-",
+            r.get("local_time") or "-",
             r.get("device_id") or "-",
             r.get("model") or "-",
             r.get("device_state") or "-",
@@ -110,6 +130,11 @@ def main() -> int:
         help="Skip IP_OWNER enrichment (no RDAP lookups).",
     )
     p.add_argument(
+        "--tz", metavar="ZONE",
+        help="IANA timezone for the LOCAL_TIME column (e.g. 'America/Denver'). "
+             "Defaults to the system local timezone.",
+    )
+    p.add_argument(
         "--format", choices=["plain", "json", "csv"], default="plain",
         help="Output format (default: plain).",
     )
@@ -118,6 +143,14 @@ def main() -> int:
         help="Write the formatted output to a file at PATH instead of stdout.",
     )
     args = p.parse_args()
+
+    tz: ZoneInfo | None = None
+    if args.tz:
+        try:
+            tz = ZoneInfo(args.tz)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            print(f"Invalid --tz '{args.tz}': {exc}", file=sys.stderr)
+            return 2
 
     try:
         sa_email = os.environ["SA_EMAIL"]
@@ -135,10 +168,13 @@ def main() -> int:
     creds = build_credentials(sa_email, admin_email, SCOPES)
     activities = fetch_caa_activity(creds, start_time, args.user)
     rows = list(latest_per_device_ip(activities).values())
+    for r in rows:
+        r["local_time"] = to_local(r["time"], tz)
 
     # Resolve each device id to a model via the Cloud Identity catalog
-    # (user-scoped — cheap; covers all the user's device types).
-    catalog = build_device_catalog(creds, user_email=args.user)
+    # (user-scoped). type_filter=None so iOS/Android records are included too,
+    # not just Macs — their model comes straight off the device record.
+    catalog = build_device_catalog(creds, user_email=args.user, type_filter=None)
     for r in rows:
         dev = catalog.get(r["device_id"]) or {}
         r["model"] = decode_model(dev.get("model")) or dev.get("model") or ""

@@ -58,7 +58,7 @@ from list_mac_devices import (
     build_credentials,
     classify_signals,
     decode_model,
-    fetch_user_device_users,
+    fetch_device_users_for_user,
     render_ip_asn,
     render_location,
     write_formatted,
@@ -180,6 +180,7 @@ _DEVICE_FIELDS = (
 
 def build_device_catalog(
     creds, user_email: str | None = None, *, debug: bool = False,
+    type_filter: str | None = "mac",
 ) -> dict[str, dict]:
     """Build `{deviceId: device_record}` for CAA-event correlation.
 
@@ -192,14 +193,16 @@ def build_device_catalog(
     valid resource paths).
 
     Scoping:
-      - `user_email=None`: enumerate all Mac devices in the tenant via
-        `devices.list(filter=type:mac)`.
+      - `user_email=None`: enumerate the tenant's devices via `devices.list`.
       - `user_email=...`: scope to that user's devices via the focused path
         (bulk deviceUsers.list + filter, then batched devices.get on the
         resulting device names). Matches the `--user` mode in
         list_mac_devices.py.
 
-    Either way, the returned map is keyed by `deviceId` so the caller's
+    `type_filter` is an Admin SDK "Mobile device search fields" `type:` token
+    (default `"mac"`); pass `None` to include every device type — e.g.
+    list_caa_device_summary.py needs iOS/Android records too, to resolve their
+    model. Either way, the returned map is keyed by `deviceId` so the caller's
     per-event lookup is O(1) with no additional API calls.
     """
     svc = build(
@@ -211,7 +214,9 @@ def build_device_catalog(
 
     devices: list[dict] = []
     if user_email:
-        users_by_device, _ = fetch_user_device_users(svc, user_email)
+        users_by_device, _ = fetch_device_users_for_user(
+            svc, user_email, type_filter,
+        )
         device_names = [f"devices/{did}" for did in users_by_device.keys()]
         if device_names:
             factories: dict[str, Callable[[], object]] = {
@@ -225,12 +230,14 @@ def build_device_catalog(
             responses = _run_batch(svc, factories, ignore_statuses={400, 404})
             devices = [resp for resp in responses.values() if resp]
     else:
-        req = svc.devices().list(
+        list_kwargs = dict(
             customer="customers/my_customer",
-            filter="type:mac",
             view="USER_ASSIGNED_DEVICES",
             fields=f"devices({_DEVICE_FIELDS}),nextPageToken",
         )
+        if type_filter:
+            list_kwargs["filter"] = f"type:{type_filter}"
+        req = svc.devices().list(**list_kwargs)
         while req is not None:
             resp = _execute(req)
             devices.extend(resp.get("devices", []))
