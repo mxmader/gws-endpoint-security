@@ -139,6 +139,38 @@ def to_local(ts: str, tz: ZoneInfo | None) -> str:
     return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+def _debug_activities(activities: list) -> None:
+    """Surface the (device id, IP) pairing inputs to stderr.
+
+    The pairing assumes one device per activity: IP/networkInfo are read off the
+    activity envelope while device id is per-event. This flags the cases that
+    break that assumption — an activity whose events span >1 device id (the
+    single envelope IP then gets shared across devices) or one with no IP — so
+    surprising pairings can be traced to their source activity.
+    """
+    multi = no_ip = total_ev = 0
+    for a in activities:
+        t = (a.get("id") or {}).get("time") or "-"
+        ip = a.get("ipAddress") or ""
+        events = a.get("events") or []
+        total_ev += len(events)
+        dids = sorted({
+            d for d in (_param(ev, "CAA_DEVICE_ID") for ev in events) if d
+        })
+        if dids and not ip:
+            no_ip += 1
+            print(f"[debug] NO-IP  t={t} devices={dids}", file=sys.stderr)
+        if len(dids) > 1:
+            multi += 1
+            print(f"[debug] MULTI  t={t} ip={ip or '-'} devices={dids}", file=sys.stderr)
+    print(
+        f"[debug] {len(activities)} activities, {total_ev} events; "
+        f"{multi} span >1 device id, {no_ip} with no IP. "
+        f"(MULTI rows are where one envelope IP is shared across devices.)",
+        file=sys.stderr,
+    )
+
+
 HEADERS = (
     "TIME", "LOCAL_TIME", "DEVICE_ID", "MODEL", "DEVICE_STATE", "EVENT",
     "IP", "IP_OWNER", "LOCATION",
@@ -192,6 +224,12 @@ def main() -> int:
         "--output", metavar="PATH",
         help="Write the formatted output to a file at PATH instead of stdout.",
     )
+    p.add_argument(
+        "--debug", action="store_true",
+        help="Print the (device id, IP) pairing inputs to stderr — flags "
+             "activities spanning >1 device id (shared envelope IP) or no IP, "
+             "to trace unexpected device/IP associations to their source.",
+    )
     args = p.parse_args()
 
     tz: ZoneInfo | None = None
@@ -216,7 +254,9 @@ def main() -> int:
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     creds = build_credentials(sa_email, admin_email, SCOPES)
-    activities = fetch_caa_activity(creds, start_time, args.user)
+    activities = list(fetch_caa_activity(creds, start_time, args.user))
+    if args.debug:
+        _debug_activities(activities)
     rows = list(latest_per_device_ip(activities).values())
     for r in rows:
         r["local_time"] = to_local(r["time"], tz)
