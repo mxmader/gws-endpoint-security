@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Sequence
 
 import google.auth
+import pycountry
 from google.auth import iam
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
@@ -92,6 +93,87 @@ def model_cell(d: dict) -> str:
     if not raw:
         return "-"
     return raw if raw == "Mac OS" else f"{raw}*"
+
+
+def device_id_cell(d: dict) -> str:
+    """DEVICE_ID-column text: the Cloud Identity deviceId(s) for this row.
+
+    A physical device can hold several Cloud Identity records (one per reporting
+    agent), so this joins every known id — letting a CAA_DEVICE_ID from
+    list_caa_events.py be matched back to a device here. Falls back to the id
+    parsed from the resource `name`; "-" when none.
+    """
+    ids = d.get("deviceIds")
+    if not ids:
+        one = _device_id(d.get("name", "") or "")
+        ids = [one] if one else []
+    return ", ".join(ids) or "-"
+
+
+# --- Location / network rendering (shared by list_signins.py + list_caa_events.py) ---
+# Both scripts read the `networkInfo` block Google stamps on Reports API
+# activity records (login + context_aware_access). These helpers decode it.
+
+def _country_name(alpha_2: str) -> str:
+    """ISO 3166-1 alpha-2 country code -> readable name ('' if unknown).
+    Prefers the short common name (e.g. 'South Korea' over 'Korea, Republic of').
+    """
+    c = pycountry.countries.get(alpha_2=alpha_2)
+    if not c:
+        return ""
+    return getattr(c, "common_name", None) or c.name
+
+
+def render_location(network_info: dict) -> str:
+    """Format `networkInfo` into a human-friendly "Subdivision, Country" string.
+
+    Decodes the ISO 3166 codes Google supplies — `subdivisionCode` (e.g.
+    "FR-IDF", "US-UT") and `regionCode` (the country, e.g. "FR") — via
+    pycountry's bundled ISO database. No external geo-IP lookup. Falls back to
+    the raw code if it isn't in the ISO database.
+    """
+    info = network_info or {}
+    sub = info.get("subdivisionCode") or ""
+    region = info.get("regionCode") or ""
+    if sub:
+        match = pycountry.subdivisions.get(code=sub)
+        country = _country_name(sub.split("-")[0])
+        if match and country:
+            return f"{match.name}, {country}"
+        if match:
+            return match.name
+        # Unknown subdivision: raw code, decorated with the country if known.
+        return f"{sub} ({country})" if country else sub
+    if region:
+        return _country_name(region) or region
+    return ""
+
+
+def render_ip_asn(network_info: dict) -> str:
+    """Render the native "IP ASN" (ASN + subdivision/region) from `networkInfo`,
+    surfaced as Google supplies it — distinct from the decoded `render_location`.
+
+    Defensive about subfield names: Google's docs don't pin the ASN field down,
+    so we try the likely keys and fall back to '' when none are present. The
+    exact shape is tenant-confirmed from a raw activity dump.
+    """
+    info = network_info or {}
+    asn = (
+        info.get("asn")
+        or info.get("autonomousSystemNumber")
+        or info.get("asNumber")
+        or info.get("regionCodeAsn")
+        or ""
+    )
+    asn = str(asn).strip()
+    label = ""
+    if asn:
+        label = asn if asn.upper().startswith("AS") else f"AS{asn}"
+    geo = info.get("subdivisionCode") or info.get("regionCode") or ""
+    if geo:
+        label = f"{label} ({geo})" if label else geo
+    return label
+
 
 # Bounded retry for transient errors (429 RATE_LIMIT_EXCEEDED, 5xx).
 _MAX_RETRIES = 4
@@ -714,6 +796,10 @@ def list_mac_devices(
                     emails[ue] = None
         d["userEmails"] = list(emails)
 
+        # All Cloud Identity deviceIds for this physical Mac (one per reporting
+        # agent). Lets a CAA_DEVICE_ID be matched back to a device here.
+        d["deviceIds"] = sorted(serial_to_device_ids.get(serial, set()))
+
         # Enrich with a human-readable model name when we recognize the
         # identifier. JSON output keeps both `model` (raw) and `modelName`
         # (narrative, or "" when unknown).
@@ -787,7 +873,10 @@ def _table_columns(devices: list[dict], with_clients: bool, include_browser: boo
     column set stays identical across formats.
     """
     def row(d: dict) -> tuple:
-        base: tuple = (", ".join(d.get("userEmails") or []) or "-",)
+        base: tuple = (
+            ", ".join(d.get("userEmails") or []) or "-",
+            device_id_cell(d),
+        )
         if include_browser:
             base = base + (d.get("browser") or "-",)
         base = base + (
@@ -806,7 +895,7 @@ def _table_columns(devices: list[dict], with_clients: bool, include_browser: boo
             return base + (", ".join(d.get("clientIds") or []) or "-",)
         return base
 
-    headers: tuple = ("USER",)
+    headers: tuple = ("USER", "DEVICE_ID")
     if include_browser:
         headers = headers + ("BROWSER",)
     headers = headers + ("SIGNALS", "SERIAL", "MODEL", "OS_VERSION", "HOSTNAME", "ASSET_TAG", "ENCRYPTION", "LAST_SYNC")

@@ -5,7 +5,7 @@ Surfaces who signed in (or tried to), when, from which IP, and via which
 method (`google_password`, `saml`, `oauth`, `unknown`), plus a `suspicious`
 flag Google sets on risky sign-ins.
 
-Each IP is annotated with its registered network owner (the `OWNER` column),
+Each IP is annotated with its registered network owner (the `IP_OWNER` column),
 resolved via RDAP and cached locally — see `ip_attribution.py`. This is on by
 default; `--no-ip-attribution` disables it (no network calls). The first run
 on a cold cache is slower while owners are looked up; later runs hit the cache.
@@ -32,47 +32,14 @@ from datetime import datetime, timedelta, timezone
 from googleapiclient.discovery import build
 
 from ip_attribution import attribute_ips
-from list_mac_devices import _format_plain, build_credentials, write_formatted
+from list_mac_devices import (
+    _format_plain,
+    build_credentials,
+    render_location,
+    write_formatted,
+)
 
 SCOPES = ["https://www.googleapis.com/auth/admin.reports.audit.readonly"]
-
-# US states + territories — ISO 3166-2:US subdivision code -> name.
-# Only US is mapped inline (this fleet is US-based and a full ISO subdivision
-# table is too much to maintain by hand). Non-US codes render as raw ISO.
-_US_SUBDIVISIONS = {
-    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
-    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
-    "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
-    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
-    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
-    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
-    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
-    "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
-    "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
-    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
-    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
-    "VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
-    "WI": "Wisconsin", "WY": "Wyoming",
-    "DC": "District of Columbia",
-    "PR": "Puerto Rico", "VI": "U.S. Virgin Islands", "GU": "Guam",
-    "MP": "Northern Mariana Islands", "AS": "American Samoa",
-}
-
-
-def render_location(network_info: dict) -> str:
-    """Format `networkInfo` into a human-friendly location string.
-
-    Uses Google-supplied data only (subdivisionCode + regionCode from the
-    activity envelope's networkInfo block). No external geo-IP lookup.
-    """
-    sub = (network_info or {}).get("subdivisionCode") or ""
-    region = (network_info or {}).get("regionCode") or ""
-    if sub.startswith("US-"):
-        name = _US_SUBDIVISIONS.get(sub[3:])
-        return f"{sub} ({name})" if name else sub
-    if sub:
-        return sub  # Non-US subdivisions: raw ISO.
-    return region or ""
 
 
 def _param(event: dict, name: str) -> str:
@@ -166,7 +133,7 @@ def flatten(
 
 
 HEADERS = (
-    "USER", "TIME", "EVENT", "LOGIN_TYPE", "SUSPICIOUS", "IP", "OWNER", "LOCATION"
+    "USER", "TIME", "EVENT", "LOGIN_TYPE", "SUSPICIOUS", "IP", "IP_OWNER", "LOCATION"
 )
 
 

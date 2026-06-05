@@ -8,6 +8,13 @@ Cloud Identity Device record (when CAA_DEVICE_ID resolves), adding the same
 columns `list_mac_devices.py` produces — SIGNALS, SERIAL, MODEL (decoded via
 mac_models.json), OS_VERSION, HOSTNAME, ASSET_TAG, ENCRYPTION, LAST_SYNC.
 
+The access attempt's own network context comes off the activity envelope (the
+same place `list_signins.py` reads it on the `login` log): IP (raw `ipAddress`),
+IP_ASN (Google's native ASN + region from `networkInfo`), LOCATION (that
+decoded to "Subdivision, Country"), and IP_OWNER (RDAP-resolved network owner,
+cached locally — see `ip_attribution.py`; `--no-ip-attribution` skips it). This
+is what ties a denied device to the IP/location it was denied from, in one log.
+
 OUTCOME column values:
 
 - `satisfied` — the named access level passed at decision time. The denial
@@ -43,6 +50,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from ip_attribution import attribute_ips
 from list_mac_devices import (
     _execute,
     _format_plain,
@@ -51,6 +59,8 @@ from list_mac_devices import (
     classify_signals,
     decode_model,
     fetch_user_device_users,
+    render_ip_asn,
+    render_location,
     write_formatted,
 )
 
@@ -115,6 +125,10 @@ def flatten(
     for activity in activities:
         user = (activity.get("actor") or {}).get("email") or ""
         time_str = (activity.get("id") or {}).get("time") or ""
+        # IP / network are on the activity envelope (same place list_signins.py
+        # reads them off the `login` log), not in the per-event parameters.
+        ip = activity.get("ipAddress") or ""
+        network_info = activity.get("networkInfo") or {}
         for ev in activity.get("events") or []:
             satisfied = _param_list(ev, "CAA_ACCESS_LEVEL_SATISFIED")
             unsatisfied = _param_list(ev, "CAA_ACCESS_LEVEL_UNSATISFIED")
@@ -150,6 +164,9 @@ def flatten(
                 "device_state": _param(ev, "CAA_DEVICE_STATE"),
                 "device_risks": device_risks,
                 "outcome": outcome,
+                "ip": ip,
+                "ip_asn": render_ip_asn(network_info),
+                "location": render_location(network_info),
                 "event_name": ev.get("name") or "",
             })
     return rows
@@ -258,6 +275,7 @@ def attach_device_fields(rows: list[dict], device_by_id: dict[str, dict]) -> Non
 HEADERS = (
     "TIME", "USER", "DEVICE_ID", "APP", "PROTECTED_API", "DEVICE_STATE",
     "DEVICE_RISKS", "OUTCOME",
+    "IP", "IP_ASN", "LOCATION", "IP_OWNER",
     "SIGNALS", "SERIAL", "MODEL", "OS_VERSION", "HOSTNAME", "ASSET_TAG",
     "ENCRYPTION", "LAST_SYNC",
 )
@@ -276,6 +294,10 @@ def _table_columns(rows: list[dict]) -> list[tuple]:
             r.get("device_state") or "-",
             ", ".join(r.get("device_risks") or []) or "-",
             r.get("outcome") or "-",
+            r.get("ip") or "-",
+            r.get("ip_asn") or "-",
+            r.get("location") or "-",
+            r.get("ip_owner") or "-",
             r.get("device_signals") or "-",
             r.get("device_serial") or "-",
             r.get("device_model") or "-",
@@ -304,10 +326,14 @@ def render_table(rows: list[dict]) -> str:
             r[5],                # DEVICE_STATE
             shrink(r[6], 40),    # DEVICE_RISKS
             r[7],                # OUTCOME
-            r[8],                # SIGNALS
-            r[9],                # SERIAL
-            shrink(r[10], 40),   # MODEL (decoded names can run long)
-            r[11], r[12], r[13], r[14], r[15],
+            shrink(r[8], 39),    # IP (IPv6 max width)
+            r[9],                # IP_ASN
+            shrink(r[10], 30),   # LOCATION
+            shrink(r[11], 30),   # IP_OWNER
+            r[12],               # SIGNALS
+            r[13],               # SERIAL
+            shrink(r[14], 40),   # MODEL (decoded names can run long)
+            r[15], r[16], r[17], r[18], r[19],
         )
         for r in full
     ]
@@ -373,6 +399,16 @@ def main() -> int:
         help="Log device-catalog size to stderr (counts entries that were "
              "available for CAA event correlation).",
     )
+    p.add_argument(
+        "--no-ip-attribution", action="store_true",
+        help="Skip IP_OWNER enrichment (no RDAP lookups). IP / IP_ASN / "
+             "LOCATION still populate from the event's native networkInfo.",
+    )
+    p.add_argument(
+        "--refresh-ip-attribution", action="store_true",
+        help="Bypass the cached owner for IPs seen this run and refetch them "
+             "from RDAP.",
+    )
     args = p.parse_args()
 
     try:
@@ -434,6 +470,26 @@ def main() -> int:
         )
 
     attach_device_fields(rows, device_by_id)
+
+    # Annotate each row's IP with its registered network owner (IP_OWNER).
+    # IP / IP_ASN / LOCATION already came off the event's native networkInfo.
+    t = time.perf_counter()
+    if args.no_ip_attribution:
+        for r in rows:
+            r["ip_owner"] = ""
+            r["ip_attribution"] = None
+    else:
+        attribution = attribute_ips(
+            (r.get("ip") for r in rows),
+            refresh=args.refresh_ip_attribution,
+        )
+        for r in rows:
+            info = attribution.get(r["ip"]) if r.get("ip") else None
+            r["ip_owner"] = (info or {}).get("owner", "")
+            r["ip_attribution"] = info
+    if args.timing:
+        timing["ip attribution (RDAP, cached)"] = time.perf_counter() - t
+
     rows.sort(key=lambda r: r.get("time") or "", reverse=True)
 
     plain_text = render_table(rows)

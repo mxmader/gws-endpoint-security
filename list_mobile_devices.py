@@ -30,6 +30,7 @@ from list_mac_devices import (
     _format_plain,
     build_credentials,
     collect_devices,
+    device_id_cell,
     write_formatted,
 )
 
@@ -104,6 +105,7 @@ def _table_columns(devices: list[dict]):
     def row(d: dict) -> tuple:
         return (
             ", ".join(d.get("userEmails") or []) or "-",
+            device_id_cell(d),
             platform_label(d),
             d.get("model") or "-",
             d.get("osVersion") or "-",
@@ -117,8 +119,8 @@ def _table_columns(devices: list[dict]):
         )
 
     headers = (
-        "USER", "PLATFORM", "MODEL", "OS_VERSION", "COMPROMISED", "ENCRYPTION",
-        "RISK_FLAGS", "OWNER", "MGMT", "SERIAL", "LAST_SYNC",
+        "USER", "DEVICE_ID", "PLATFORM", "MODEL", "OS_VERSION", "COMPROMISED",
+        "ENCRYPTION", "RISK_FLAGS", "OWNER", "MGMT", "SERIAL", "LAST_SYNC",
     )
     return headers, [row(d) for d in devices]
 

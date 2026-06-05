@@ -95,7 +95,7 @@ there is no per-sign-in browser data in Workspace audit logs.
 
 **IP ownership is not a Google field.** The `login` activity gives a bare
 `ipAddress` plus a coarse geographic `networkInfo` block (`subdivisionCode` /
-`regionCode`) — it carries **no ISP, ASN, or registrant**. The `OWNER` column
+`regionCode`) — it carries **no ISP, ASN, or registrant**. The `IP_OWNER` column
 in `list_signins.py` is filled by a separate module,
 [`ip_attribution.py`](../ip_attribution.py), which resolves each IP to its
 **RDAP-registered network owner** (the org that holds the block at its RIR —

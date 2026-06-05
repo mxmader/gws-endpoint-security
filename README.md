@@ -34,8 +34,9 @@ with domain-wide delegation:
   Admin SDK Reports `token` activity log.
 - [`list_signins.py`](./list_signins.py) — per-user sign-in events with IP,
   login method, and suspicious-flag, from the Admin SDK Reports `login`
-  activity log. The IP is annotated with its registered network `OWNER`
-  (RDAP-resolved, locally cached — see [`ip_attribution.py`](./ip_attribution.py));
+  activity log. The IP is annotated with its registered network owner
+  (`IP_OWNER` column; RDAP-resolved, locally cached — see
+  [`ip_attribution.py`](./ip_attribution.py));
   pass `--no-ip-attribution` to skip the lookups. (Note: browser user-agent is
   **not** on this surface.)
 - [`list_auth_factors.py`](./list_auth_factors.py) — per-user **authentication
@@ -49,7 +50,15 @@ with domain-wide delegation:
   decision events filtered by access level name, correlated row-by-row
   with the matching Cloud Identity Device record (same columns
   `list_mac_devices.py` produces). Tells you which user/device/app
-  combinations are being challenged at the access boundary.
+  combinations are being challenged at the access boundary, and carries the
+  attempt's IP / IP_ASN / LOCATION / IP_OWNER from the event envelope — so a
+  denied device is tied to the IP it was denied from, in one log.
+- [`list_caa_device_summary.py`](./list_caa_device_summary.py) — concise
+  companion to the above: for one `--user` over `--days`, one row per unique
+  **(device id, IP)** pair showing the **most recent** CAA event for it
+  (regardless of outcome) — TIME, DEVICE_ID, MODEL, DEVICE_STATE, IP, IP_OWNER,
+  LOCATION, grouped by device. A deduped "travel trace" of where each of a
+  user's devices has recently appeared at the access boundary.
 
 See [docs/google_device_data_sources.md](./docs/google_device_data_sources.md)
 for what signals the device API actually exposes and how to interpret them.
@@ -135,6 +144,7 @@ Read-Only" custom admin role assigned to a service-style account.
 | `list_signins.py` | Admin API Privileges → **Reports** (Read) |
 | `list_auth_factors.py` | Admin API Privileges → **Reports** (Read) + **Users** (Read) |
 | `list_caa_events.py` | Admin API Privileges → **Reports** (Read) + Services → **Mobile Device Management** (Read) |
+| `list_caa_device_summary.py` | Admin API Privileges → **Reports** (Read) + Services → **Mobile Device Management** (Read) |
 
 A single role bundling all of these (full Mobile Device Management +
 Users (Read) + Reports (Read)) covers every script. The only
@@ -155,6 +165,7 @@ uv run python list_users_with_macs.py               # users -> Macs correlation
 uv run python list_app_authorizations.py --days 30  # OAuth app grants, last 30 days
 uv run python list_signins.py --days 7              # sign-in events with IP + owner + method
 uv run python list_auth_factors.py --days 30        # per-user auth factors + 2SV posture
+uv run python list_caa_device_summary.py --user alice@example.com --days 7  # latest CAA event per device
 uv run python prune_devices.py                      # DRY RUN of prune candidates
 uv run python prune_devices.py --execute            # actually delete
 ```
