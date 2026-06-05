@@ -27,6 +27,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -197,22 +198,64 @@ def _vcard_field(vcard_array: list, name: str) -> str:
     return ""
 
 
-def _owner_from_entities(entities: list) -> str:
-    """Best registrant/owner name across RDAP entities, preferring the
-    `registrant` role, then `administrative`, then anything with a name."""
-    by_role: dict[str, str] = {}
-    fallback = ""
+def _iter_entities(entities: list):
+    """Yield every entity, flattening RDAP's nested `entities` (RIPE nests the
+    registrant/maintainer under the abuse contact, etc.)."""
     for ent in entities or []:
-        roles = ent.get("roles") or []
-        name = _vcard_field(ent.get("vcardArray") or [], "fn") or _vcard_field(
-            ent.get("vcardArray") or [], "org"
-        )
+        yield ent
+        yield from _iter_entities(ent.get("entities"))
+
+
+# RIPE often tags each contact's `fn` with its role, e.g. "Cloudflare Abuse
+# Contact" — strip that to recover the bare org name.
+_CONTACT_SUFFIX_RE = re.compile(
+    r"\s+(abuse|technical|administrative|registrant)\s+contact$", re.IGNORECASE
+)
+
+
+def _looks_like_handle(name: str, handle: str) -> bool:
+    """True when `name` is just a registry handle, not an org name — e.g. a
+    RIPE maintainer object (`MNT-CLOUDFLARE`, `SFR-MNT`) or `fn` echoing the
+    entity handle. These are noise, never the entity we want."""
+    n = (name or "").strip()
+    if not n:
+        return True
+    if handle and n.upper() == handle.strip().upper():
+        return True
+    up = n.upper()
+    return up.startswith("MNT-") or up.endswith("-MNT")
+
+
+def _owner_from_entities(entities: list) -> str:
+    """Best org/owner name across RDAP entities. Skips maintainer/NIC handles,
+    prefers an actual organisation (vCard kind=org), then the registrant /
+    admin / technical / abuse contact — with RIPE's "… Contact" role suffix
+    stripped. Returns '' when only handles are present (caller falls back to the
+    network name)."""
+    by_role: dict[str, str] = {}
+    org_name = ""
+    fallback = ""
+    for ent in _iter_entities(entities):
+        vcard = ent.get("vcardArray") or []
+        raw = _vcard_field(vcard, "fn") or _vcard_field(vcard, "org")
+        if _looks_like_handle(raw, ent.get("handle") or ""):
+            continue
+        name = _CONTACT_SUFFIX_RE.sub("", raw).strip()
         if not name:
             continue
+        if _vcard_field(vcard, "kind") == "org" and not org_name:
+            org_name = name
         fallback = fallback or name
-        for role in roles:
+        for role in ent.get("roles") or []:
             by_role.setdefault(role, name)
-    return by_role.get("registrant") or by_role.get("administrative") or fallback
+    return (
+        org_name
+        or by_role.get("registrant")
+        or by_role.get("administrative")
+        or by_role.get("technical")
+        or by_role.get("abuse")
+        or fallback
+    )
 
 
 def _cidrs_from_response(resp: dict) -> list[str]:
