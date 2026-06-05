@@ -93,6 +93,49 @@ identifiers available. If you need browser attribution for a specific Mac,
 look at the EV-equipped Device records in `list_mac_devices.py` instead;
 there is no per-sign-in browser data in Workspace audit logs.
 
+### Authentication factors (`login_challenge_method`, same `login` log)
+
+The *factor* a user actually authenticated with — passkey, FIDO2 security
+key, password, TOTP/authenticator, Google prompt (push), backup code, SMS/voice
+— is **not** on the `login_success` `login_type` field. It lives on the
+`login_challenge` / `login_verification` events (which `list_signins.py`
+filters out by default) in a parameter called **`login_challenge_method`**.
+Surfaced by the sibling script
+[`list_auth_factors.py`](../list_auth_factors.py) as a per-user rollup.
+
+Quirks worth knowing:
+
+- **It's multi-valued.** A single sign-in lists every challenge encountered,
+  e.g. two bad password tries then a security key →
+  `["password", "password", "security_key"]`. The shape returned by the
+  discovery client is **not yet confirmed against this tenant** — the Reports
+  API has been seen to encode multi-valued params as `multiValue` (plain
+  strings), `multiStrValue`, or `multiValue` of `{"value": ...}` dicts. The
+  `_param_multi` helper handles all three; **verify which one actually fires**
+  before trusting the rollup (see that script's runbook).
+- **Failed ≠ possession.** `login_challenge_status` is `"Challenge Passed."` /
+  `"Challenge Failed."` (or empty). A *failed* security-key attempt must not
+  make a user look like they use security keys, so only passed challenges
+  contribute a factor.
+- **Strength tiers** the script applies: passkey / `security_key` /
+  `cross_device` / `device_prompt` = **strong** (phishing-resistant);
+  `google_prompt` (push) / `google_authenticator` / `offline_otp` =
+  **medium**; `backup_code` / `rescue_code` / `idv_*` (SMS, voice, email) =
+  **weak**; `password` and `saml` = **none** (primary factor only). The
+  per-user "weakest factor" ranks the weakest *second* factor — password is the
+  primary and is excluded, so a user with no second factor reads as
+  password-only (the worst posture).
+- **SAML is opaque here.** For `saml` logins the real second factor lives at
+  the external IdP and is invisible to Workspace, so it's flagged, not credited
+  as strong.
+
+The rollup is joined with each user's Directory **2-step-verification**
+posture (`isEnrolledIn2Sv`, `isEnforcedIn2Sv`), producing four populations:
+active enrolled users, in-directory users with **no sign-ins** in the window
+(can't assess — sorted last), and identities that **signed in but aren't in the
+directory** (ex-employees / external — 2SV shown as `?`). Rows sort
+worst-posture-first, the same convention as the device reports.
+
 ### OAuth-app authorizations (separate report, not on Device records)
 
 App-level authorizations — "what apps does user X have access tokens for" —

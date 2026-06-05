@@ -35,6 +35,13 @@ with domain-wide delegation:
 - [`list_signins.py`](./list_signins.py) — per-user sign-in events with IP,
   login method, and suspicious-flag, from the Admin SDK Reports `login`
   activity log. (Note: browser user-agent is **not** on this surface.)
+- [`list_auth_factors.py`](./list_auth_factors.py) — per-user **authentication
+  factor** rollup from the same `login` log: which factors each user actually
+  used (passkey, FIDO2 security key, password, TOTP, Google prompt, backup
+  code, SMS/voice) and their *weakest* one, joined with Directory 2-step-
+  verification posture (`isEnrolledIn2Sv` / `isEnforcedIn2Sv`). Rows sort
+  worst-posture-first: not-enrolled / password-only users on top. `--weak-only`
+  and `--unenrolled-only` narrow to the "fix these first" set.
 - [`list_caa_events.py`](./list_caa_events.py) — Context-Aware Access
   decision events filtered by access level name, correlated row-by-row
   with the matching Cloud Identity Device record (same columns
@@ -100,9 +107,10 @@ What each scope powers:
   get; the Mac correlation in CAA events is a `deviceId` join against a
   pre-built catalog).
 - `admin.reports.audit.readonly` — `list_app_authorizations.py`,
-  `list_signins.py`, `list_caa_events.py`.
+  `list_signins.py`, `list_auth_factors.py`, `list_caa_events.py`.
 - `cloud-identity.devices` (write) — `prune_devices.py`.
-- `admin.directory.user.readonly` — `list_users_with_macs.py` (user list).
+- `admin.directory.user.readonly` — `list_users_with_macs.py` (user list),
+  `list_auth_factors.py` (2SV enrollment join).
 
 Wait ~2 minutes for propagation.
 
@@ -122,6 +130,7 @@ Read-Only" custom admin role assigned to a service-style account.
 | `prune_devices.py` | Services → **Mobile Device Management** (full — *not* the Read-only sub-privilege) |
 | `list_app_authorizations.py` | Admin API Privileges → **Reports** (Read) |
 | `list_signins.py` | Admin API Privileges → **Reports** (Read) |
+| `list_auth_factors.py` | Admin API Privileges → **Reports** (Read) + **Users** (Read) |
 | `list_caa_events.py` | Admin API Privileges → **Reports** (Read) + Services → **Mobile Device Management** (Read) |
 
 A single role bundling all of these (full Mobile Device Management +
@@ -142,6 +151,7 @@ uv run python list_other_devices.py                 # Windows/Linux/ChromeOS/etc
 uv run python list_users_with_macs.py               # users -> Macs correlation
 uv run python list_app_authorizations.py --days 30  # OAuth app grants, last 30 days
 uv run python list_signins.py --days 7              # sign-in events with IP + method
+uv run python list_auth_factors.py --days 30        # per-user auth factors + 2SV posture
 uv run python prune_devices.py                      # DRY RUN of prune candidates
 uv run python prune_devices.py --execute            # actually delete
 ```
