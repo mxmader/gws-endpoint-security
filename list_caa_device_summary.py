@@ -212,6 +212,12 @@ def main() -> int:
         help="Skip IP_OWNER enrichment (no RDAP lookups).",
     )
     p.add_argument(
+        "--refresh-ip-attribution", action="store_true",
+        help="Bypass the cached owner for IPs seen this run and refetch them "
+             "from RDAP (use after an extraction fix, or to re-resolve stale "
+             "entries).",
+    )
+    p.add_argument(
         "--tz", metavar="ZONE",
         help="IANA timezone for the LOCAL_TIME column (e.g. 'America/Denver'). "
              "Defaults to the system local timezone.",
@@ -274,7 +280,9 @@ def main() -> int:
         for r in rows:
             r["ip_owner"] = ""
     else:
-        attribution = attribute_ips(r["ip"] for r in rows)
+        attribution = attribute_ips(
+            (r["ip"] for r in rows), refresh=args.refresh_ip_attribution,
+        )
         for r in rows:
             info = attribution.get(r["ip"]) if r.get("ip") else None
             r["ip_owner"] = (info or {}).get("owner", "")

@@ -206,10 +206,20 @@ def _iter_entities(entities: list):
         yield from _iter_entities(ent.get("entities"))
 
 
-# RIPE often tags each contact's `fn` with its role, e.g. "Cloudflare Abuse
-# Contact" — strip that to recover the bare org name.
+# RIPE tags each contact's `fn` with its role — "Cloudflare Abuse Contact",
+# "SFR Legal Contact", "Starlink Admin" — strip that trailing descriptor to
+# recover the bare org name. Only known role phrases are stripped (not generic
+# words), so legit names like "French Data Network" survive.
 _CONTACT_SUFFIX_RE = re.compile(
-    r"\s+(abuse|technical|administrative|registrant)\s+contact$", re.IGNORECASE
+    r"\s+(?:"
+    r"(?:(?:abuse|technical|administrative|legal|registrant)\s+)?contact"
+    r"|admin(?:istrator)?"
+    r"|noc"
+    r"|hostmaster"
+    r"|ip\s+coordinator"
+    r"|network\s+operations(?:\s+cent(?:er|re))?"
+    r")$",
+    re.IGNORECASE,
 )
 
 
