@@ -60,13 +60,24 @@ def _load_mac_models() -> dict[str, str]:
 
 
 _MAC_MODELS = _load_mac_models()
+# Comma-insensitive index. Some signal sources (e.g. the CAA event log feeding
+# list_caa_events.py) report the identifier with the comma stripped — "Mac1610"
+# instead of "Mac16,10" — so an exact lookup misses. Stripping commas is
+# collision-free across the current catalog, so we fall back to this index.
+_MAC_MODELS_NOCOMMA = {k.replace(",", ""): v for k, v in _MAC_MODELS.items()}
 
 
 def decode_model(raw: str | None) -> str:
-    """Map an Apple model identifier to a human-readable name, or '' if unknown."""
+    """Map an Apple model identifier to a human-readable name, or '' if unknown.
+
+    Tolerant of the comma-stripped form ("Mac1610") some sources emit.
+    """
     if not raw:
         return ""
-    return _MAC_MODELS.get(raw, "")
+    hit = _MAC_MODELS.get(raw)
+    if hit is not None:
+        return hit
+    return _MAC_MODELS_NOCOMMA.get(raw.replace(",", ""), "")
 
 # Bounded retry for transient errors (429 RATE_LIMIT_EXCEEDED, 5xx).
 _MAX_RETRIES = 4
